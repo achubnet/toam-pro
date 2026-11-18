@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>TO Coords — карта</title>
+  <link rel="stylesheet" href="map.css">
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <footer id="panel">
+    <div class="group">
+      <span class="label">Карта</span>
+      <button data-action="map-out" title="Отдалить карту">−</button>
+      <button data-action="map-in" title="Приблизить карту">+</button>
+    </div>
+    <div class="group" data-parkour>
+      <span class="label">Камера</span>
+      <button data-action="camera-closer" title="Камера ближе">−</button>
+      <button data-action="camera-farther" title="Камера дальше">+</button>
+    </div>
+    <div class="group" data-parkour>
+      <button data-action="bushes">Кусты</button>
+    </div>
+    <div id="info"></div>
+    <div id="status"></div>
+  </footer>
+  <script src="../shared/map-geometry.js"></script>
+  <script src="map-layers.js"></script>
+  <script src="map-renderer.js"></script>
+  <script src="map.js"></script>
+</body>
+</html>

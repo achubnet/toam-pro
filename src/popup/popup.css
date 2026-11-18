@@ -1,0 +1,40 @@
+body {
+  margin: 0;
+  padding: 12px 14px 16px;
+  width: 280px;
+  background: #101418;
+  color: #e8edf2;
+  font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+p, ul {
+  margin: 0 0 10px;
+  color: #c5ccd3;
+}
+
+ul {
+  padding-left: 18px;
+}
+
+code {
+  color: #9ad07a;
+}
+
+button, a {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 5px;
+  background: #1a6885;
+  color: #fff;
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}

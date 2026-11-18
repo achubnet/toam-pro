@@ -1,43 +1,13 @@
-/**
- *
- *   toCoords.me()        → { x, y, z, heading, headingDeg, ready }  // metres
- *   toCoords.speed()     → { kmh, mps, ready, source }
- *   toCoords.ahead()     → { hull:{type,name,dist}, barrel:{type,name,dist} }
- *   toCoords.rayDebug()  → raw hull+barrel rays (no other players' data)
- *   toCoords.status()    → hooks / why something is empty
- *   toCoords.exportMap() → downloads tanki-map-<name>.json (static geometry only)
- *   toCoords.minimap(true|false|{zoom,follow,flipX,flipY,rotate})
- *   toCoords.pickMapFolder() / grantMapFolder() / loadMapFile() / saveMap(force)
- *   toCoords.scan() / debug() / stop()
- *   Hotkey M toggles the in-game minimap.
- *
- * Open map-view.html and load the JSON for a top-down map and A* route.
- * Maps are cached in the chosen folder (and IndexedDB) and reused next battle.
- *
- * Engine units are centimetres. The game itself shows speed as 0.01 * units/s
- * (m/s). Positions like (7871, -7483, 78) are ~79 m, -75 m, 0.78 m.
- * Hull ray is horizontal (static only). Barrel/дуло ray follows the local
- * weapon muzzle direction in 3D (including elevation), never an aim-target
- * or another player. Tank hits are ignored (static behind, or nothing).
- * Distances in metres (engine units × 0.01, once).
- */
 (function () {
   "use strict";
+
+  var G = TOC.game.names;
+  var GAME = TOC.game;
 
   if (window.toCoords && typeof window.toCoords.stop === "function") {
     try { window.toCoords.stop(); } catch (e) {}
   }
 
-  // Kill-switches to isolate side effects on the game (bisect shooting bugs).
-  // localStorage "toCoords.off" = comma list; read once at document_start.
-  //   cn        Function.prototype.callableName + Object.defineProperty hooks
-  //   listeners EventTarget.addEventListener wrapper
-  //   wrapPoint wrapping the game's initPoint / initNewStylePoint callbacks
-  //   pos       calling the game's getLocalTankPosition / isLocalTankAlive
-  //   scan      heap scans (map, radar, muzzle discovery)
-  //   camera    parkour camera distance (Shift + / -)
-  //   trees     hiding trees / bushes in parkour
-  //   all       everything above
   var OFF_KEYS = ["cn", "listeners", "wrapPoint", "pos", "scan", "camera", "trees"];
   var OFF = {};
   try {
@@ -51,41 +21,27 @@
     try { console.log("[toCoords] выключено (toCoords.off): " + offList().join(", ")); } catch (eOffLog) {}
   }
 
-  var OVERLAY_ID = "to-coords-overlay";
-  // Official tank-velocity overlay: display = 0.01 * engineSpeed.
   var UNIT = 0.01;
   var RAY_MAX_M = 100;
   var RAY_MAX = RAY_MAX_M / UNIT;
-  var ORIGIN_UP = 1.0 / UNIT;   // 1 m above hull origin
-  var ORIGIN_FWD = 0.8 / UNIT;  // 80 cm along the ray, just outside the hull
+  var ORIGIN_UP = 1.0 / UNIT;
+  var ORIGIN_FWD = 0.8 / UNIT;
   var MIN_HIT_M = 3;
-  var MIN_HIT = MIN_HIT_M / UNIT; // ignore own hull / ground under the tank
+  var MIN_HIT = MIN_HIT_M / UNIT;
   var MOUNT_MATCH_M = 5;
   var MOUNT_MATCH = MOUNT_MATCH_M / UNIT;
   var SPEED_WINDOW_MS = 500;
-  var MAX_MPS = 40; // reject outliers (tanks are ~3–15 m/s)
+  var MAX_MPS = 40;
   var RAY_INTERVAL_MS = 250;
-  var INTERESTING = {
-    getLocalTankPosition: 1,
-    isLocalTankAlive: 1,
-    showPositionLocalTank: 1,
-    fillPhysicsState: 1,
-    setPhysicsTransform: 1,
-    updatePhysicsState: 1,
-    onTankPositionQuery: 1,
-    onLocalTankFirstSpawn: 1,
-    onTankPossessed: 1,
-    onSpawn: 1,
-    updateInput: 1,
-    initPoint: 1,
-    initNewStylePoint: 1
-  };
+  var CALLABLE_ROLES = {};
+  Object.keys(GAME.callables).forEach(function (role) { CALLABLE_ROLES[GAME.callables[role]] = role; });
 
   var hooks = {
-    getLocalTankPosition: null,
-    isLocalTankAlive: null,
-    showPositionLocalTank: null,
-    fillPhysicsState: null,
+    localTankPosition: null,
+    localTankAlive: null,
+    printLocalTankPosition: null,
+    initPoint: null,
+    initNewStylePoint: null,
     physicsBody: null,
     physicsWorld: null,
     camera: null,
@@ -94,21 +50,29 @@
     radarSystem: null
   };
   var radarScanRuns = 0;
-  var RADAR_SCAN_MAX_RUNS = 360; // ~90 s of light scanning per battle
+  var RADAR_SCAN_MAX_RUNS = 360;
   var bodyCandidates = [];
   var mountCandidates = [];
   var foundCallables = {};
   var scanStats = { runs: 0, visited: 0, lastMs: 0, lastError: null };
-  var lastMeEngine = null; // engine units
-  var lastMe = null;       // metres, for API/overlay
+  var lastMeEngine = null;
+  var lastMe = null;
   var lastQuat = null;
   var lastHeading = null;
   var lastHeadingSource = null;
   var lastSource = null;
-  var lastPosRef = null;   // real Vector3, for cloning ray origin/dir
+  var lastPosRef = null;
   var running = true;
+  var lastHeadingDebug = null;
+  var pageStartedAt = performance.now();
+
+  function readSetting(key, fallback) {
+    try { var v = localStorage.getItem(key); return v == null ? fallback : v; } catch (e) { return fallback; }
+  }
+  function writeSetting(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
   var rafId = 0;
-  var overlay = null;
   var debugOn = false;
   var debugLog = [];
   try {
@@ -142,7 +106,6 @@
   }
   function logDebug(msg) {
     msg = String(msg);
-    // Same kind of message (digits ignored) at most once per 2 s; console only for the first 3 of a kind unless debug is on.
     var kind = msg.replace(/[-\d.]+/g, "#").slice(0, 60);
     var now = Date.now();
     var k = logKinds[kind] || (logKinds[kind] = { n: 0, at: 0, dropped: 0 });
@@ -161,10 +124,6 @@
     } catch (e2) {}
   }
 
-  // callableName hook, v2. The game tags some functions (fn.callableName = "x").
-  // The first such assignment becomes an ordinary own data property — exactly
-  // what the game gets without us — and only functions we care about are queued.
-  // Nothing of ours runs inside the game's code; the queue is read in our frame.
   var cnQueue = [];
   function installCallableNameHook() {
     if (Function.prototype.__toCoordsCN) {
@@ -180,7 +139,7 @@
         get: function () { return undefined; },
         set: function (v) {
           try { dp(this, "callableName", { value: v, writable: true, enumerable: true, configurable: true }); } catch (e) {}
-          if (typeof v === "string" && has.call(INTERESTING, v) && cnQueue.length < 500) cnQueue.push(this);
+          if (typeof v === "string" && has.call(CALLABLE_ROLES, v) && cnQueue.length < 500) cnQueue.push(this);
         }
       });
       dp(Function.prototype, "__toCoordsCN", { value: true });
@@ -196,13 +155,13 @@
     }
   }
   if (!OFF.cn) installCallableNameHook();
-  logDebug("session start hooks=" + (hooks.getLocalTankPosition ? "pos" : "no-pos"));
+  logDebug("session start hooks=" + (hooks.localTankPosition ? "pos" : "no-pos"));
 
   function isVec3String(s) {
-    return typeof s === "string" && s.indexOf("Vector3 (") === 0;
+    return typeof s === "string" && s.indexOf(GAME.tags.vector) === 0;
   }
   function isQuatString(s) {
-    return typeof s === "string" && s.indexOf("Quaternion(") === 0;
+    return typeof s === "string" && s.indexOf(GAME.tags.quaternion) === 0;
   }
   function isFiniteNum(v) {
     return typeof v === "number" && isFinite(v);
@@ -221,14 +180,14 @@
     var s;
     try { s = obj.toString(); } catch (e) { s = ""; }
     if (isVec3String(s)) {
-      var m = /^Vector3 \((.+), (.+), (.+)\)$/.exec(s);
+      var m = GAME.vectorText.exec(s);
       if (!m) return null;
       var x = Number(m[1]), y = Number(m[2]), z = Number(m[3]);
       if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return null;
       return { x: x, y: y, z: z, ref: obj };
     }
-    if (isFiniteNum(obj.f20_1) && isFiniteNum(obj.g20_1) && isFiniteNum(obj.h20_1)) {
-      return { x: obj.f20_1, y: obj.g20_1, z: obj.h20_1, ref: obj };
+    if (isFiniteNum(obj[G.x]) && isFiniteNum(obj[G.y]) && isFiniteNum(obj[G.z])) {
+      return { x: obj[G.x], y: obj[G.y], z: obj[G.z], ref: obj };
     }
     return null;
   }
@@ -236,13 +195,13 @@
   function parseQuaternion(obj) {
     if (!obj || (typeof obj !== "object" && typeof obj !== "function")) return null;
     var w, x, y, z;
-    if (isFiniteNum(obj.i23_1) && isFiniteNum(obj.j23_1) && isFiniteNum(obj.k23_1) && isFiniteNum(obj.l23_1)) {
-      w = obj.i23_1; x = obj.j23_1; y = obj.k23_1; z = obj.l23_1;
+    if (isFiniteNum(obj[G.quatW]) && isFiniteNum(obj[G.quatX]) && isFiniteNum(obj[G.quatY]) && isFiniteNum(obj[G.quatZ])) {
+      w = obj[G.quatW]; x = obj[G.quatX]; y = obj[G.quatY]; z = obj[G.quatZ];
     } else {
       var s;
       try { s = obj.toString(); } catch (e) { return null; }
       if (!isQuatString(s)) return null;
-      var m = /^Quaternion\((.+), (.+), (.+), (.+)\)$/.exec(s);
+      var m = GAME.quaternionText.exec(s);
       if (!m) return null;
       w = Number(m[1]); x = Number(m[2]); y = Number(m[3]); z = Number(m[4]);
     }
@@ -258,10 +217,10 @@
 
   function bodyAngularAbs(body) {
     try {
-      var w = body && body.v9i_1 && body.v9i_1.h9j_1;
+      var w = body && body[G.bodyState] && body[G.bodyState][G.angularVelocity];
       if (!w) return 0;
-      if (isFiniteNum(w.h20_1)) {
-        return Math.sqrt((w.f20_1 || 0) * (w.f20_1 || 0) + (w.g20_1 || 0) * (w.g20_1 || 0) + (w.h20_1 || 0) * (w.h20_1 || 0));
+      if (isFiniteNum(w[G.z])) {
+        return Math.sqrt((w[G.x] || 0) * (w[G.x] || 0) + (w[G.y] || 0) * (w[G.y] || 0) + (w[G.z] || 0) * (w[G.z] || 0));
       }
       if (isFiniteNum(w.z) || isFiniteNum(w.x)) {
         return Math.sqrt((w.x || 0) * (w.x || 0) + (w.y || 0) * (w.y || 0) + (w.z || 0) * (w.z || 0));
@@ -272,8 +231,8 @@
 
   function bodyHeadingInfo(body) {
     try {
-      if (!body || !body.v9i_1) return null;
-      var q = parseQuaternion(body.v9i_1.g9j_1);
+      if (!body || !body[G.bodyState]) return null;
+      var q = parseQuaternion(body[G.bodyState][G.orientation]);
       if (!q) return null;
       var f = quatForwardXY(q);
       if (!f) return null;
@@ -283,13 +242,11 @@
         heading: Math.atan2(f.y, f.x),
         forward: f,
         ang: bodyAngularAbs(body),
-        vel: parseVector3(body.v9i_1.f9j_1)
+        vel: parseVector3(body[G.bodyState][G.velocity])
       };
     } catch (e) { return null; }
   }
 
-  // Bodies to look for our hull in: scanned candidates + every body of every
-  // physics world we know (a battle can have several). Refreshed 4x a second.
   var hullPoolCache = [], hullPoolAt = 0;
   function hullPool() {
     var now = performance.now();
@@ -325,8 +282,6 @@
       var matched = matchLocalBody(enginePos);
       return matched ? bodyHeadingInfo(matched) : null;
     }
-    // Nearest body is our hull. Keep the previous one while it is still close,
-    // so the marker never jumps to an ally / bonus box passing by.
     nearby.sort(function (a, b) { return a.dist - b.dist; });
     for (i = 0; i < nearby.length; i++) {
       if (nearby[i].body === hooks.physicsBody && nearby[i].dist <= nearby[0].dist + 60) {
@@ -338,8 +293,8 @@
     }
     hooks.physicsBody = nearby[0].body;
     try {
-      if (nearby[0].body.b9i_1 && nearby[0].body.b9i_1.zz0_1 && typeof nearby[0].body.b9i_1.zz0_1.z9l === "function") {
-        hooks.physicsWorld = nearby[0].body.b9i_1.zz0_1;
+      if (nearby[0].body[G.bodyOwner] && nearby[0].body[G.bodyOwner][G.entityWorld] && typeof nearby[0].body[G.bodyOwner][G.entityWorld][G.raycast] === "function") {
+        hooks.physicsWorld = nearby[0].body[G.bodyOwner][G.entityWorld];
         attachCameraFromWorld(hooks.physicsWorld);
       }
     } catch (e) {}
@@ -352,17 +307,14 @@
     return Math.atan2(vel.y, vel.x);
   }
 
-  // Hull forward = local +Y, as in the game (barrel dir = mount matrix * (0,1,0)).
-  // Never switch to the X axis: on a slope that turned the marker sideways.
   function quatForwardXY(q) {
     if (!q) return null;
     var w = q.w, x = q.x, y = q.y, z = q.z;
-    var fx = 2 * (x * y - w * z);       // local Y axis in world
+    var fx = 2 * (x * y - w * z);
     var fy = 1 - 2 * (x * x + z * z);
     var fz = 2 * (y * z + w * x);
     var len = Math.sqrt(fx * fx + fy * fy);
     if (len < 0.15) {
-      // Nose straight up/down: the local up axis (Z) points back/forward.
       var zx = 2 * (x * z + w * y), zy = 2 * (y * z - w * x);
       var sgn = fz > 0 ? -1 : 1;
       fx = sgn * zx; fy = sgn * zy;
@@ -375,59 +327,56 @@
   function headingFromDelta(a, b) {
     if (!a || !b) return null;
     var dx = b.x - a.x, dy = b.y - a.y;
-    if (dx * dx + dy * dy < 25) return null; // < 5 cm, ignore
+    if (dx * dx + dy * dy < 25) return null;
     return Math.atan2(dy, dx);
   }
 
   function readPositionFromHook() {
-    // Own tank body via the follow camera (camera.lzs_1 = our tank physics,
-    // .mzq_1 / fbk() = body). Works in battles where the mine system never
-    // created getLocalTankPosition (no supplies), and reads only our own tank.
     var own = ownBodyFromCamera();
-    if (!OFF.pos && own && own.v9i_1) {
-      var ov = parseVector3(own.v9i_1.i9j_1);
+    if (!OFF.pos && own && own[G.bodyState]) {
+      var ov = parseVector3(own[G.bodyState][G.position]);
       if (ov) {
         lastSource = "followCamera.body";
         lastPosRef = ov.ref || lastPosRef;
-        ov._quat = parseQuaternion(own.v9i_1.g9j_1);
-        ov._vel = parseVector3(own.v9i_1.f9j_1);
+        ov._quat = parseQuaternion(own[G.bodyState][G.orientation]);
+        ov._vel = parseVector3(own[G.bodyState][G.velocity]);
         return ov;
       }
     }
-    if (!OFF.pos && typeof hooks.getLocalTankPosition === "function") {
-      var r = safeCall(hooks.getLocalTankPosition);
+    if (!OFF.pos && typeof hooks.localTankPosition === "function") {
+      var r = safeCall(hooks.localTankPosition);
       if (r && !r.__error) {
         var v = parseVector3(r);
         if (v) {
-          lastSource = "getLocalTankPosition";
+          lastSource = "localTankPosition";
           lastPosRef = v.ref || lastPosRef;
           return v;
         }
       }
     }
-    if (!OFF.pos && typeof hooks.showPositionLocalTank === "function") {
+    if (!OFF.pos && typeof hooks.printLocalTankPosition === "function") {
       var captured = null;
       var fake = {
-        z2i: function (msg) { captured = msg; },
+        [G.consolePrint]: function (msg) { captured = msg; },
         toString: function () { return "toCoordsConsole"; }
       };
-      var sr = safeCall(hooks.showPositionLocalTank, [fake]);
+      var sr = safeCall(hooks.printLocalTankPosition, [fake]);
       if (!sr || !sr.__error && typeof captured === "string") {
-        var m = /Vector3 \((.+), (.+), (.+)\)/.exec(captured || "");
+        var m = GAME.vectorText.exec(captured || "");
         if (m) {
-          lastSource = "showPositionLocalTank";
+          lastSource = "printLocalTankPosition";
           return { x: Number(m[1]), y: Number(m[2]), z: Number(m[3]), ref: null };
         }
       }
     }
     var matched = matchLocalBody(lastMeEngine);
-    if (matched && matched.v9i_1) {
-      var pv = parseVector3(matched.v9i_1.i9j_1);
+    if (matched && matched[G.bodyState]) {
+      var pv = parseVector3(matched[G.bodyState][G.position]);
       if (pv) {
-        lastSource = "physicsBody.v9i_1";
+        lastSource = "physicsBody[G.bodyState]";
         lastPosRef = pv.ref || lastPosRef;
-        pv._quat = parseQuaternion(matched.v9i_1.g9j_1);
-        pv._vel = parseVector3(matched.v9i_1.f9j_1);
+        pv._quat = parseQuaternion(matched[G.bodyState][G.orientation]);
+        pv._vel = parseVector3(matched[G.bodyState][G.velocity]);
         return pv;
       }
     }
@@ -436,26 +385,24 @@
 
   function ownBodyFromCamera() {
     try {
-      var tp = followCam && followCam.lzs_1;
+      var tp = followCam && followCam[G.cameraTankPhysics];
       if (!tp) return null;
-      var b = tp.mzq_1 || (typeof tp.fbk === "function" ? tp.fbk() : null);
-      return b && b.v9i_1 ? b : null;
+      var b = tp[G.physicsBody] || (typeof tp[G.getBody] === "function" ? tp[G.getBody]() : null);
+      return b && b[G.bodyState] ? b : null;
     } catch (e) { return null; }
   }
 
   function isLocalAlive() {
-    if (OFF.pos || typeof hooks.isLocalTankAlive !== "function") return null;
-    var r = safeCall(hooks.isLocalTankAlive);
+    if (OFF.pos || typeof hooks.localTankAlive !== "function") return null;
+    var r = safeCall(hooks.localTankAlive);
     if (r && r.__error) return null;
     return !!r;
   }
 
-  /* ---------- match the local tank's physics body ---------- */
-
   function bodyPos(body) {
     try {
-      if (!body || !body.v9i_1) return null;
-      return parseVector3(body.v9i_1.i9j_1);
+      if (!body || !body[G.bodyState]) return null;
+      return parseVector3(body[G.bodyState][G.position]);
     } catch (e) { return null; }
   }
 
@@ -468,12 +415,11 @@
       d = Math.abs(p.x - enginePos.x) + Math.abs(p.y - enginePos.y) + Math.abs(p.z - enginePos.z);
       if (d < bestD) { bestD = d; best = bodyCandidates[i]; }
     }
-    // 3 m tolerance (300 engine units)
     if (best && bestD < 300) {
       hooks.physicsBody = best;
       try {
-        if (best.b9i_1 && best.b9i_1.zz0_1 && typeof best.b9i_1.zz0_1.z9l === "function") {
-          hooks.physicsWorld = best.b9i_1.zz0_1;
+        if (best[G.bodyOwner] && best[G.bodyOwner][G.entityWorld] && typeof best[G.bodyOwner][G.entityWorld][G.raycast] === "function") {
+          hooks.physicsWorld = best[G.bodyOwner][G.entityWorld];
           attachCameraFromWorld(hooks.physicsWorld);
         }
       } catch (e) {}
@@ -484,14 +430,12 @@
 
   function readBodyVelMps(body) {
     try {
-      if (!body || !body.v9i_1) return null;
-      var v = parseVector3(body.v9i_1.f9j_1);
+      if (!body || !body[G.bodyState]) return null;
+      var v = parseVector3(body[G.bodyState][G.velocity]);
       if (!v) return null;
       return Math.sqrt(v.x * v.x + v.y * v.y) * UNIT;
     } catch (e) { return null; }
   }
-
-  /* ---------- speed: body velocity preferred, else 0.5s window ---------- */
 
   function updateSpeed(enginePos, now, body) {
     var bodyMps = readBodyVelMps(body);
@@ -514,7 +458,6 @@
     var first = speedSamples[0], last = speedSamples[speedSamples.length - 1];
     var dt = (last.t - first.t) / 1000;
     if (dt < 0.2) return;
-    // reject a window that contains a huge jump (respawn / interpolation)
     var i, d, inst, prev = first, worst = 0;
     for (i = 1; i < speedSamples.length; i++) {
       d = Math.hypot(speedSamples[i].x - prev.x, speedSamples[i].y - prev.y) * UNIT;
@@ -533,23 +476,18 @@
     speedState.source = "window";
   }
 
-  /* ---------- static-only raycast ---------- */
-
   var TANKISH_NAME = /hull|turret|chassis|tank|cannon|weapon|barrel/i;
 
-  // Game's own static filter: only bodies with no ECS world link (b9i_1).
-  // Do not also require missing v9i_1 — static props can still have a transform.
   function staticOnlyFilter(body) {
     try {
       if (!body) return false;
-      if (body.b9i_1 != null) return false;
+      if (body[G.bodyOwner] != null) return false;
       return true;
     } catch (e) {
       return false;
     }
   }
   var STATIC_FILTER = { m9r: staticOnlyFilter };
-  // When false, never call the game's physics raycast (b9m/z9l); use our own JS ray on map geometry.
   var engineRaysOn = false;
   try { if (localStorage.getItem("toCoords.engineRays") === "1") engineRaysOn = true; } catch (eER) {}
 
@@ -574,11 +512,11 @@
   function nameFromHit(shape) {
     if (!shape) return null;
     var body = null;
-    try { body = shape.r9j_1 || null; } catch (e) { body = null; }
+    try { body = shape[G.shapeBody] || null; } catch (e) { body = null; }
     var cands = [];
-    try { cands.push(nameFromValue(shape.n9j_1), nameFromValue(shape.q9j_1)); } catch (e) {}
+    try { cands.push(nameFromValue(shape[G.shapeTag]), nameFromValue(shape[G.shapeTagAlt])); } catch (e) {}
     if (body) {
-      try { cands.push(nameFromValue(body.n9j_1), nameFromValue(body.q9j_1), nameFromValue(body)); } catch (e) {}
+      try { cands.push(nameFromValue(body[G.shapeTag]), nameFromValue(body[G.shapeTagAlt]), nameFromValue(body)); } catch (e) {}
     }
     for (var i = 0; i < cands.length; i++) if (cands[i]) return cands[i];
     return null;
@@ -586,14 +524,14 @@
 
   function isTankishHit(hit) {
     try {
-      var shape = hit && hit.i9q_1;
+      var shape = hit && hit[G.hitShape];
       if (!shape) return false;
-      var body = shape.r9j_1 || null;
-      if (body && body.b9i_1 != null) return true;
+      var body = shape[G.shapeBody] || null;
+      if (body && body[G.bodyOwner] != null) return true;
       var raw = [];
-      try { raw.push(shape.n9j_1, shape.q9j_1); } catch (e) {}
+      try { raw.push(shape[G.shapeTag], shape[G.shapeTagAlt]); } catch (e) {}
       if (body) {
-        try { raw.push(body.n9j_1, body.q9j_1); } catch (e) {}
+        try { raw.push(body[G.shapeTag], body[G.shapeTagAlt]); } catch (e) {}
       }
       for (var i = 0; i < raw.length; i++) {
         if (typeof raw[i] === "string" && TANKISH_NAME.test(raw[i])) return true;
@@ -613,59 +551,59 @@
 
   function makeGameVec(x, y, z) {
     var v = null;
-    if (lastPosRef && typeof lastPosRef.d21 === "function") {
-      try { v = lastPosRef.d21(); } catch (e) { v = null; }
+    if (lastPosRef && typeof lastPosRef[G.clone] === "function") {
+      try { v = lastPosRef[G.clone](); } catch (e) { v = null; }
     }
-    if (v && isFiniteNum(v.f20_1)) {
-      v.f20_1 = x; v.g20_1 = y; v.h20_1 = z;
-      if (typeof v.n23 === "function") {
-        try { v.n23(x, y, z); } catch (e) {}
+    if (v && isFiniteNum(v[G.x])) {
+      v[G.x] = x; v[G.y] = y; v[G.z] = z;
+      if (typeof v[G.setXYZ] === "function") {
+        try { v[G.setXYZ](x, y, z); } catch (e) {}
       }
       return v;
     }
-    return { f20_1: x, g20_1: y, h20_1: z };
+    return { [G.x]: x, [G.y]: y, [G.z]: z };
   }
 
   function makeHitResult() {
     var normal = {
-      f20_1: 0, g20_1: 0, h20_1: 0,
-      n23: function (x, y, z) { this.f20_1 = x; this.g20_1 = y; this.h20_1 = z; },
-      k26: function (o) {
+      [G.x]: 0, [G.y]: 0, [G.z]: 0,
+      [G.setXYZ]: function (x, y, z) { this[G.x] = x; this[G.y] = y; this[G.z] = z; },
+      [G.copyFrom]: function (o) {
         if (!o) return;
-        this.f20_1 = o.f20_1; this.g20_1 = o.g20_1; this.h20_1 = o.h20_1;
+        this[G.x] = o[G.x]; this[G.y] = o[G.y]; this[G.z] = o[G.z];
       }
     };
     var point = {
-      f20_1: 0, g20_1: 0, h20_1: 0,
-      u27: function (origin, dist, dir) {
-        this.f20_1 = origin.f20_1 + dist * dir.f20_1;
-        this.g20_1 = origin.g20_1 + dist * dir.g20_1;
-        this.h20_1 = origin.h20_1 + dist * dir.h20_1;
+      [G.x]: 0, [G.y]: 0, [G.z]: 0,
+      [G.setOnRay]: function (origin, dist, dir) {
+        this[G.x] = origin[G.x] + dist * dir[G.x];
+        this[G.y] = origin[G.y] + dist * dir[G.y];
+        this[G.z] = origin[G.z] + dist * dir[G.z];
       }
     };
     return {
-      l9q_1: 0,
-      i9q_1: null,
-      k9q_1: normal,
-      j9q_1: point,
-      m9q_1: 0,
-      o9q_1: 0,
-      p9q_1: 0,
-      n9q_1: 0,
-      h9s: function (o) {
+      [G.hitDistance]: 0,
+      [G.hitShape]: null,
+      [G.hitNormal]: normal,
+      [G.hitPoint]: point,
+      [G.hitTests]: 0,
+      [G.hitStatA]: 0,
+      [G.hitStatB]: 0,
+      [G.hitStatC]: 0,
+      [G.copyHit]: function (o) {
         if (!o) return;
-        this.l9q_1 = o.l9q_1;
-        this.i9q_1 = o.i9q_1;
-        this.m9q_1 = o.m9q_1;
-        if (o.k9q_1) this.k9q_1.k26(o.k9q_1);
-        if (o.j9q_1) {
-          this.j9q_1.f20_1 = o.j9q_1.f20_1;
-          this.j9q_1.g20_1 = o.j9q_1.g20_1;
-          this.j9q_1.h20_1 = o.j9q_1.h20_1;
+        this[G.hitDistance] = o[G.hitDistance];
+        this[G.hitShape] = o[G.hitShape];
+        this[G.hitTests] = o[G.hitTests];
+        if (o[G.hitNormal]) this[G.hitNormal][G.copyFrom](o[G.hitNormal]);
+        if (o[G.hitPoint]) {
+          this[G.hitPoint][G.x] = o[G.hitPoint][G.x];
+          this[G.hitPoint][G.y] = o[G.hitPoint][G.y];
+          this[G.hitPoint][G.z] = o[G.hitPoint][G.z];
         }
       },
-      d3: function () {},
-      d21: function () { return this; }
+      [G.resetHit]: function () {},
+      [G.clone]: function () { return this; }
     };
   }
 
@@ -692,31 +630,30 @@
 
   function attachCameraFromWorld(world) {
     try {
-      var cam = world && world.yyw_1;
-      if (cam && cam.u35_1 && isFiniteNum(cam.u35_1.h20_1)) {
+      var cam = world && world[G.renderCamera];
+      if (cam && cam[G.cameraRotation] && isFiniteNum(cam[G.cameraRotation][G.z])) {
         hooks.camera = cam;
       }
     } catch (e) {}
   }
 
-  // Follow-cam pitch looks down at the tank, not along the barrel — yaw only.
   function dirFromCamera() {
     var cam = hooks.camera;
     if (!cam) {
       attachCameraFromWorld(hooks.physicsWorld);
       cam = hooks.camera;
     }
-    if (!cam || !cam.u35_1) return null;
-    var yaw = cam.u35_1.h20_1;
+    if (!cam || !cam[G.cameraRotation]) return null;
+    var yaw = cam[G.cameraRotation][G.z];
     if (!isFiniteNum(yaw)) return null;
     return { x: -Math.sin(yaw), y: Math.cos(yaw), z: 0 };
   }
 
   function looksLikeMuzzleSocket(s) {
     try {
-      return !!(s && s.tzk_1 && isFiniteNum(s.tzk_1.f20_1) &&
-        s.wzk_1 && isFiniteNum(s.wzk_1.f20_1) && isFiniteNum(s.wzk_1.g20_1) &&
-        isFiniteNum(s.wzk_1.h20_1));
+      return !!(s && s[G.socketPosition] && isFiniteNum(s[G.socketPosition][G.x]) &&
+        s[G.socketDirection] && isFiniteNum(s[G.socketDirection][G.x]) && isFiniteNum(s[G.socketDirection][G.y]) &&
+        isFiniteNum(s[G.socketDirection][G.z]));
     } catch (e) {
       return false;
     }
@@ -724,8 +661,8 @@
 
   function rememberMount(obj) {
     try {
-      if (!(obj && obj.pzr_1 && typeof obj.pzr_1.r24 === "function")) return;
-      if (!obj.vzr_1 || typeof obj.vzr_1.length !== "number") return;
+      if (!(obj && obj[G.mountMatrix] && typeof obj[G.mountMatrix][G.rotateVector] === "function")) return;
+      if (!obj[G.mountSockets] || typeof obj[G.mountSockets].length !== "number") return;
       if (mountCandidates.indexOf(obj) >= 0) return;
       if (mountCandidates.length > 40) mountCandidates.shift();
       mountCandidates.push(obj);
@@ -733,33 +670,30 @@
   }
 
   function dirFromMountMatrix(mount) {
-    if (!mount || !mount.pzr_1 || typeof mount.pzr_1.r24 !== "function") return null;
+    if (!mount || !mount[G.mountMatrix] || typeof mount[G.mountMatrix][G.rotateVector] !== "function") return null;
     var localY = makeGameVec(0, 1, 0);
     var out = makeGameVec(0, 0, 0);
     try {
-      mount.pzr_1.r24(localY, out);
+      mount[G.mountMatrix][G.rotateVector](localY, out);
     } catch (e) {
       return null;
     }
-    return normalizeDir(out.f20_1, out.g20_1, out.h20_1);
+    return normalizeDir(out[G.x], out[G.y], out[G.z]);
   }
 
-  // Local mount only (muzzle near OUR hull). Direction is official
-  // barrelDirectionProvider vector wzk_1 — 3D, includes elevation.
-  // Never reads an aim-target / other player.
   function dirFromLocalMount(engineMe) {
     if (!engineMe || !mountCandidates.length) return null;
     var bestSock = null, bestMount = null, bestD = Infinity, i, j, m, socks, s, dx, dy, dz, d2, dir;
     for (i = 0; i < mountCandidates.length; i++) {
       m = mountCandidates[i];
-      socks = m.vzr_1;
+      socks = m[G.mountSockets];
       if (!socks) continue;
       for (j = 0; j < socks.length; j++) {
         s = socks[j];
         if (!looksLikeMuzzleSocket(s)) continue;
-        dx = s.tzk_1.f20_1 - engineMe.x;
-        dy = s.tzk_1.g20_1 - engineMe.y;
-        dz = s.tzk_1.h20_1 - engineMe.z;
+        dx = s[G.socketPosition][G.x] - engineMe.x;
+        dy = s[G.socketPosition][G.y] - engineMe.y;
+        dz = s[G.socketPosition][G.z] - engineMe.z;
         d2 = dx * dx + dy * dy + dz * dz;
         if (d2 < bestD) {
           bestD = d2;
@@ -769,15 +703,15 @@
       }
     }
     if (!bestSock || bestD > MOUNT_MATCH * MOUNT_MATCH) return null;
-    dir = normalizeDir(bestSock.wzk_1.f20_1, bestSock.wzk_1.g20_1, bestSock.wzk_1.h20_1);
+    dir = normalizeDir(bestSock[G.socketDirection][G.x], bestSock[G.socketDirection][G.y], bestSock[G.socketDirection][G.z]);
     if (!dir) dir = dirFromMountMatrix(bestMount);
     if (!dir) return null;
     return {
       dir: dir,
       origin: {
-        x: bestSock.tzk_1.f20_1,
-        y: bestSock.tzk_1.g20_1,
-        z: bestSock.tzk_1.h20_1
+        x: bestSock[G.socketPosition][G.x],
+        y: bestSock[G.socketPosition][G.y],
+        z: bestSock[G.socketPosition][G.z]
       }
     };
   }
@@ -801,16 +735,16 @@
   }
 
   function callZ9l(world, origin, dir, maxDist, mask, hit, filter) {
-    return world.z9l(origin, dir, maxDist, mask, hit, filter);
+    return world[G.raycast](origin, dir, maxDist, mask, hit, filter);
   }
 
   function interpretHit(ok, hit, dbg, engineMe, ox, oy, oz, fwd, traveled) {
     dbg.z9lResult = !!ok;
     if (hit) {
-      dbg.hitDistEngine = isFiniteNum(hit.l9q_1) ? hit.l9q_1 + traveled : null;
+      dbg.hitDistEngine = isFiniteNum(hit[G.hitDistance]) ? hit[G.hitDistance] + traveled : null;
       dbg.hitDistM = dbg.hitDistEngine != null ? toM(dbg.hitDistEngine) : null;
-      dbg.hitNormalZ = hit.k9q_1 ? hit.k9q_1.h20_1 : null;
-      try { dbg.hitShapeName = hit.i9q_1 ? (hit.i9q_1.n9j_1 || null) : null; } catch (e) { dbg.hitShapeName = null; }
+      dbg.hitNormalZ = hit[G.hitNormal] ? hit[G.hitNormal][G.z] : null;
+      try { dbg.hitShapeName = hit[G.hitShape] ? (hit[G.hitShape][G.shapeTag] || null) : null; } catch (e) { dbg.hitShapeName = null; }
     }
     if (!ok) return emptyAhead();
     if (isTankishHit(hit)) {
@@ -818,14 +752,14 @@
       return emptyAhead();
     }
     dbg.rejectedAsTank = false;
-    var dist = hit.l9q_1;
+    var dist = hit[G.hitDistance];
     if (!isFiniteNum(dist) || dist < 0 || dist > RAY_MAX * 1.05) return emptyAhead();
     var hx = ox + fwd.x * dist;
     var hy = oy + fwd.y * dist;
     var hz = oz + fwd.z * dist;
-    var nz = hit.k9q_1 ? hit.k9q_1.h20_1 : 0;
+    var nz = hit[G.hitNormal] ? hit[G.hitNormal][G.z] : 0;
     if (!isFiniteNum(nz)) nz = 0;
-    var cls = classifyHit(nz, nameFromHit(hit.i9q_1));
+    var cls = classifyHit(nz, nameFromHit(hit[G.hitShape]));
     return { type: cls.type, name: cls.name, dist: toM(dist + traveled) };
   }
 
@@ -836,12 +770,12 @@
       headingDeg: engineMe && radToDeg(engineMe.heading),
       headingSource: lastHeadingSource,
       hasQuat: !!lastQuat,
-      worldFound: !!(hooks.physicsWorld && typeof hooks.physicsWorld.z9l === "function"),
-      z9lArity: hooks.physicsWorld && hooks.physicsWorld.z9l && hooks.physicsWorld.z9l.length,
+      worldFound: !!(hooks.physicsWorld && typeof hooks.physicsWorld[G.raycast] === "function"),
+      z9lArity: hooks.physicsWorld && hooks.physicsWorld[G.raycast] && hooks.physicsWorld[G.raycast].length,
       bodyMatched: !!hooks.physicsBody,
       cameraFound: !!hooks.camera,
       mountsFound: mountCandidates.length,
-      clonedVec: !!(lastPosRef && typeof lastPosRef.d21 === "function"),
+      clonedVec: !!(lastPosRef && typeof lastPosRef[G.clone] === "function"),
       maxDistEngine: RAY_MAX,
       maxDistM: RAY_MAX_M,
       minHitEngine: MIN_HIT,
@@ -856,7 +790,7 @@
     };
   }
 
-  var STATIC_MASK = 16; // official static-geometry group used by oz5().b9m(..., 16, hit)
+  var STATIC_MASK = GAME.staticMask;
   var staticPrimCache = { at: 0, prims: null, debug: null };
 
   function getCollisionWorlds() {
@@ -867,14 +801,14 @@
       seen.push(o);
       out.push(o);
       if (seen.length > 30) return;
-      try { if (o.zyv_1) add(o.zyv_1); } catch (e) {}
-      try { if (o.g9m_1) add(o.g9m_1); } catch (e2) {}
-      try { if (o.zz0_1) add(o.zz0_1); } catch (e3) {}
-      try { if (o.c9i_1) add(o.c9i_1); } catch (e4) {}
+      try { if (o[G.physics]) add(o[G.physics]); } catch (e) {}
+      try { if (o[G.collisionDetector]) add(o[G.collisionDetector]); } catch (e2) {}
+      try { if (o[G.entityWorld]) add(o[G.entityWorld]); } catch (e3) {}
+      try { if (o[G.bodyLink]) add(o[G.bodyLink]); } catch (e4) {}
     }
     add(hooks.physicsWorld);
     add(hooks.physicsBody);
-    try { if (hooks.physicsBody && hooks.physicsBody.b9i_1) add(hooks.physicsBody.b9i_1); } catch (e5) {}
+    try { if (hooks.physicsBody && hooks.physicsBody[G.bodyOwner]) add(hooks.physicsBody[G.bodyOwner]); } catch (e5) {}
     return out;
   }
 
@@ -891,7 +825,7 @@
     function consider(b) {
       if (!b || seen.indexOf(b) >= 0) return;
       try {
-        if (!(b.v9i_1 || b.o9i_1)) return;
+        if (!(b[G.bodyState] || b[G.bodyShapes])) return;
       } catch (e) { return; }
       seen.push(b);
       bodies.push(b);
@@ -903,9 +837,9 @@
     var worlds = getCollisionWorlds(), i, w;
     for (i = 0; i < worlds.length; i++) {
       w = worlds[i];
-      try { considerList(w.q9m_1); } catch (e) {}
-      try { if (w.zyv_1) considerList(w.zyv_1.q9m_1); } catch (e2) {}
-      try { if (w.g9m_1) considerList(w.g9m_1.q9m_1); } catch (e3) {}
+      try { considerList(w[G.bodies]); } catch (e) {}
+      try { if (w[G.physics]) considerList(w[G.physics][G.bodies]); } catch (e2) {}
+      try { if (w[G.collisionDetector]) considerList(w[G.collisionDetector][G.bodies]); } catch (e3) {}
     }
     for (i = 0; i < bodyCandidates.length; i++) consider(bodyCandidates[i]);
     return bodies;
@@ -915,7 +849,7 @@
     var bodies = [], seen = [];
     function consider(b) {
       if (!b || seen.indexOf(b) >= 0) return;
-      try { if (!(b.v9i_1 || b.o9i_1)) return; } catch (e) { return; }
+      try { if (!(b[G.bodyState] || b[G.bodyShapes])) return; } catch (e) { return; }
       seen.push(b);
       bodies.push(b);
     }
@@ -924,9 +858,9 @@
       for (i = 0; i < arr.length; i++) consider(arr[i]);
     }
     if (!world) return bodies;
-    try { considerList(world.q9m_1); } catch (e) {}
-    try { if (world.zyv_1) considerList(world.zyv_1.q9m_1); } catch (e2) {}
-    try { if (world.g9m_1) considerList(world.g9m_1.q9m_1); } catch (e3) {}
+    try { considerList(world[G.bodies]); } catch (e) {}
+    try { if (world[G.physics]) considerList(world[G.physics][G.bodies]); } catch (e2) {}
+    try { if (world[G.collisionDetector]) considerList(world[G.collisionDetector][G.bodies]); } catch (e3) {}
     return bodies;
   }
 
@@ -938,10 +872,10 @@
   function isStaticBody(b) {
     if (!b || b === hooks.physicsBody) return false;
     try {
-      if (b.b9i_1 != null) return false;
+      if (b[G.bodyOwner] != null) return false;
     } catch (e) { return false; }
     try {
-      var raw = [b.n9j_1, b.q9j_1];
+      var raw = [b[G.shapeTag], b[G.shapeTagAlt]];
       var i;
       for (i = 0; i < raw.length; i++) {
         if (typeof raw[i] === "string" && TANKISH_NAME.test(raw[i])) return false;
@@ -952,29 +886,28 @@
 
   function readShapeName(shape) {
     try {
-      var n = shape && shape.n9j_1;
+      var n = shape && shape[G.shapeTag];
       if (typeof n === "string" && n && !TANKISH_NAME.test(n)) return n;
     } catch (e) {}
     return null;
   }
 
   function matFromTransform(tr) {
-    if (!tr || !isFiniteNum(tr.g22_1)) return null;
+    if (!tr || !isFiniteNum(tr[G.m00])) return null;
     return {
-      g22: tr.g22_1, h22: tr.h22_1, i22: tr.i22_1,
-      j22: tr.j22_1, k22: tr.k22_1, l22: tr.l22_1,
-      m22: tr.m22_1, n22: tr.n22_1, o22: tr.o22_1
+      g22: tr[G.m00], h22: tr[G.m10], i22: tr[G.m20],
+      j22: tr[G.m01], k22: tr[G.m11], l22: tr[G.m21],
+      m22: tr[G.m02], n22: tr[G.m12], o22: tr[G.m22]
     };
   }
 
   function posFromTransform(tr) {
-    if (!tr || !isFiniteNum(tr.y23_1)) return null;
-    return { x: tr.y23_1, y: tr.z23_1, z: tr.a24_1 };
+    if (!tr || !isFiniteNum(tr[G.tx])) return null;
+    return { x: tr[G.tx], y: tr[G.ty], z: tr[G.tz] };
   }
 
   function matToEuler(m) {
     if (!m) return { x: 0, y: 0, z: 0 };
-    // Inverse of rotateEuler: Rz * Ry * Rx, columns are world images of local axes.
     var r00 = m.g22, r10 = m.h22, r20 = m.i22;
     var r01 = m.j22, r11 = m.k22, r21 = m.l22;
     var r02 = m.m22, r12 = m.n22, r22 = m.o22;
@@ -1006,11 +939,11 @@
   function isExportableStaticShape(shape) {
     if (!shape) return false;
     try {
-      var body = shape.r9j_1;
-      if (body && (body === hooks.physicsBody || body.b9i_1 != null)) return false;
+      var body = shape[G.shapeBody];
+      if (body && (body === hooks.physicsBody || body[G.bodyOwner] != null)) return false;
     } catch (e) { return false; }
     try {
-      var n = shape.n9j_1;
+      var n = shape[G.shapeTag];
       if (typeof n === "string" && TANKISH_NAME.test(n)) return false;
     } catch (e2) {}
     return true;
@@ -1019,7 +952,7 @@
   function collectionLen(v) {
     try {
       if (v == null) return 0;
-      if (typeof v.e1 === "function") return v.e1();
+      if (typeof v[G.size] === "function") return v[G.size]();
       if (typeof v.length === "number") return v.length;
     } catch (e) {}
     return null;
@@ -1032,24 +965,23 @@
     into.push(shape);
   }
 
-  // Shapes live in the static grid/kd-tree that b9m(mask 16) walks (zi.j9o).
   function collectShapesFromAccel(world, into, seen, stats) {
     if (!world) return;
     try {
-      var grid = world.w9n_1;
-      if (grid && grid.l9p_1 && typeof grid.l9p_1.length === "number") {
-        var cells = grid.l9p_1, ci, cell, list, si, filled = 0;
+      var grid = world[G.staticGrid];
+      if (grid && grid[G.gridCells] && typeof grid[G.gridCells].length === "number") {
+        var cells = grid[G.gridCells], ci, cell, list, si, filled = 0;
         stats.grids.push({
           cells: cells.length,
-          cellSize: grid.k9p_1 || null,
-          nx: grid.n9p_1 || null,
-          ny: grid.o9p_1 || null,
-          nz: grid.p9p_1 || null
+          cellSize: grid[G.gridCellSize] || null,
+          nx: grid[G.gridCountX] || null,
+          ny: grid[G.gridCountY] || null,
+          nz: grid[G.gridCountZ] || null
         });
         for (ci = 0; ci < cells.length; ci++) {
           cell = cells[ci];
-          if (!cell || !cell.f9q_1) continue;
-          list = iterList(cell.f9q_1);
+          if (!cell || !cell[G.cellShapes]) continue;
+          list = iterList(cell[G.cellShapes]);
           if (list.length) filled++;
           for (si = 0; si < list.length; si++) addUniqueShape(list[si], into, seen);
         }
@@ -1065,18 +997,18 @@
         if (treeSeen.has(node)) return;
         treeSeen.add(node);
         try {
-          if (node.w9q_1) {
-            var leaf = iterList(node.w9q_1), li;
+          if (node[G.nodeShapes]) {
+            var leaf = iterList(node[G.nodeShapes]), li;
             stats.treeLeaves++;
             for (li = 0; li < leaf.length; li++) addUniqueShape(leaf[li], into, seen);
           }
         } catch (e2) {}
-        try { if (node.s9q_1) walkTree(node.s9q_1, depth + 1); } catch (e3) {}
-        try { if (node.t9q_1) walkTree(node.t9q_1, depth + 1); } catch (e4) {}
+        try { if (node[G.nodeLeft]) walkTree(node[G.nodeLeft], depth + 1); } catch (e3) {}
+        try { if (node[G.nodeRight]) walkTree(node[G.nodeRight], depth + 1); } catch (e4) {}
       }
-      if (world.v9n_1) {
+      if (world[G.staticTree]) {
         stats.trees++;
-        walkTree(world.v9n_1, 0);
+        walkTree(world[G.staticTree], 0);
       }
     } catch (e5) {
       stats.treeErrors = (stats.treeErrors || 0) + 1;
@@ -1090,8 +1022,8 @@
     for (i = 0; i < worlds.length; i++) {
       w = worlds[i];
       collectShapesFromAccel(w, into, seen, stats);
-      try { if (w.g9m_1) collectShapesFromAccel(w.g9m_1, into, seen, stats); } catch (e) {}
-      try { if (w.zyv_1) collectShapesFromAccel(w.zyv_1, into, seen, stats); } catch (e2) {}
+      try { if (w[G.collisionDetector]) collectShapesFromAccel(w[G.collisionDetector], into, seen, stats); } catch (e) {}
+      try { if (w[G.physics]) collectShapesFromAccel(w[G.physics], into, seen, stats); } catch (e2) {}
     }
     stats.shapeCount = into.length;
     return { shapes: into, stats: stats };
@@ -1100,8 +1032,8 @@
   function extractShapePrim(shape) {
     if (!shape) return null;
     var tr = null, pos = null, mat = null, typ = null;
-    try { tr = shape.t9j_1; } catch (e) {}
-    try { typ = shape.l9j_1; } catch (e0) {}
+    try { tr = shape[G.shapeTransform]; } catch (e) {}
+    try { typ = shape[G.shapeType]; } catch (e0) {}
     pos = posFromTransform(tr);
     mat = matFromTransform(tr);
     var hasXform = !!(pos && mat);
@@ -1111,8 +1043,8 @@
     var he, prim, v0, v1, v2, aabb;
 
     try {
-      if (shape.i9u_1 && isFiniteNum(shape.i9u_1.f20_1) && hasXform) {
-        he = { x: shape.i9u_1.f20_1, y: shape.i9u_1.g20_1, z: shape.i9u_1.h20_1 };
+      if (shape[G.boxHalfSize] && isFiniteNum(shape[G.boxHalfSize][G.x]) && hasXform) {
+        he = { x: shape[G.boxHalfSize][G.x], y: shape[G.boxHalfSize][G.y], z: shape[G.boxHalfSize][G.z] };
         prim = {
           kind: "box",
           name: name,
@@ -1126,13 +1058,13 @@
     } catch (e2) {}
 
     try {
-      if (shape.s9v_1 && isFiniteNum(shape.s9v_1.f20_1) && hasXform) {
+      if (shape[G.planeHalfSize] && isFiniteNum(shape[G.planeHalfSize][G.x]) && hasXform) {
         prim = {
           kind: "plane",
           name: name,
           pos: pos,
           mat: mat,
-          he: { x: shape.s9v_1.f20_1, y: shape.s9v_1.g20_1, z: 0 },
+          he: { x: shape[G.planeHalfSize][G.x], y: shape[G.planeHalfSize][G.y], z: 0 },
           euler: matToEuler(mat)
         };
         return prim;
@@ -1140,10 +1072,10 @@
     } catch (e3) {}
 
     try {
-      if (shape.k9x_1 && shape.l9x_1 && shape.m9x_1 && isFiniteNum(shape.k9x_1.f20_1) && !shape.i9u_1) {
-        v0 = { x: shape.k9x_1.f20_1, y: shape.k9x_1.g20_1, z: isFiniteNum(shape.k9x_1.h20_1) ? shape.k9x_1.h20_1 : 0 };
-        v1 = { x: shape.l9x_1.f20_1, y: shape.l9x_1.g20_1, z: isFiniteNum(shape.l9x_1.h20_1) ? shape.l9x_1.h20_1 : 0 };
-        v2 = { x: shape.m9x_1.f20_1, y: shape.m9x_1.g20_1, z: isFiniteNum(shape.m9x_1.h20_1) ? shape.m9x_1.h20_1 : 0 };
+      if (shape[G.triangleA] && shape[G.triangleB] && shape[G.triangleC] && isFiniteNum(shape[G.triangleA][G.x]) && !shape[G.boxHalfSize]) {
+        v0 = { x: shape[G.triangleA][G.x], y: shape[G.triangleA][G.y], z: isFiniteNum(shape[G.triangleA][G.z]) ? shape[G.triangleA][G.z] : 0 };
+        v1 = { x: shape[G.triangleB][G.x], y: shape[G.triangleB][G.y], z: isFiniteNum(shape[G.triangleB][G.z]) ? shape[G.triangleB][G.z] : 0 };
+        v2 = { x: shape[G.triangleC][G.x], y: shape[G.triangleC][G.y], z: isFiniteNum(shape[G.triangleC][G.z]) ? shape[G.triangleC][G.z] : 0 };
         prim = {
           kind: "triangle",
           name: name,
@@ -1156,8 +1088,8 @@
     } catch (e4) {}
 
     try {
-      if ((typ === 2 || (shape.j9w_1 && isFiniteNum(shape.j9w_1) && !shape.i9u_1))) {
-        var rad = isFiniteNum(shape.j9w_1) ? shape.j9w_1 : 0;
+      if ((typ === 2 || (shape[G.sphereRadius] && isFiniteNum(shape[G.sphereRadius]) && !shape[G.boxHalfSize]))) {
+        var rad = isFiniteNum(shape[G.sphereRadius]) ? shape[G.sphereRadius] : 0;
         if (rad > 0) {
           return {
             kind: "aabb",
@@ -1170,78 +1102,18 @@
     } catch (eSph) {}
 
     try {
-      aabb = shape.u9j_1;
-      if (aabb && isFiniteNum(aabb.y1z_1) && isFiniteNum(aabb.b20_1)) {
+      aabb = shape[G.shapeBounds];
+      if (aabb && isFiniteNum(aabb[G.minX]) && isFiniteNum(aabb[G.maxX])) {
         prim = {
           kind: "aabb",
           name: name,
-          min: { x: aabb.y1z_1, y: aabb.z1z_1, z: aabb.a20_1 },
-          max: { x: aabb.b20_1, y: aabb.c20_1, z: aabb.d20_1 }
+          min: { x: aabb[G.minX], y: aabb[G.minY], z: aabb[G.minZ] },
+          max: { x: aabb[G.maxX], y: aabb[G.maxY], z: aabb[G.maxZ] }
         };
         return prim;
       }
     } catch (e5) {}
     return null;
-  }
-
-  function keyArrayLens(obj) {
-    var out = {}, keys, i, name, val, len;
-    try { keys = Object.getOwnPropertyNames(obj); } catch (e) { return out; }
-    for (i = 0; i < keys.length && i < 50; i++) {
-      name = keys[i];
-      try {
-        val = obj[name];
-        len = collectionLen(val);
-        if (len != null && len > 0) out[name] = len;
-      } catch (e2) {}
-    }
-    return out;
-  }
-
-  function describeShape(shape) {
-    var info = { type: null, group: null, name: null, ctor: null, keys: [], arrays: {}, has: {} };
-    if (!shape) return info;
-    try { info.type = shape.l9j_1; } catch (e) {}
-    try { info.group = shape.p9j_1; } catch (e2) {}
-    try { info.name = typeof shape.n9j_1 === "string" ? shape.n9j_1 : null; } catch (e3) {}
-    try { info.ctor = shape.constructor && shape.constructor.name; } catch (e4) {}
-    try { info.callableName = shape.callableName || null; } catch (e5) {}
-    try { info.keys = Object.getOwnPropertyNames(shape).slice(0, 40); } catch (e6) {}
-    info.arrays = keyArrayLens(shape);
-    try {
-      info.has = {
-        i9u_1: !!(shape.i9u_1 && isFiniteNum(shape.i9u_1.f20_1)),
-        s9v_1: !!(shape.s9v_1 && isFiniteNum(shape.s9v_1.f20_1)),
-        k9x_1: !!(shape.k9x_1 && isFiniteNum(shape.k9x_1.f20_1)),
-        t9j_1: !!(shape.t9j_1 && isFiniteNum(shape.t9j_1.g22_1)),
-        u9j_1: !!(shape.u9j_1 && isFiniteNum(shape.u9j_1.y1z_1)),
-        j9w_1: isFiniteNum(shape.j9w_1)
-      };
-    } catch (e7) {}
-    return info;
-  }
-
-  function describeStaticBodies(bodies) {
-    var out = [], i, b, shapes, j, rec;
-    for (i = 0; i < bodies.length; i++) {
-      b = bodies[i];
-      if (!isStaticBody(b)) continue;
-      rec = { ctor: null, keys: [], arrays: {}, shapeCount: 0, shapes: [] };
-      try { rec.ctor = b.constructor && b.constructor.name; } catch (e) {}
-      try { rec.callableName = b.callableName || null; } catch (e2) {}
-      try { rec.keys = Object.getOwnPropertyNames(b).slice(0, 50); } catch (e3) {}
-      rec.arrays = keyArrayLens(b);
-      try { rec.d9i_1 = b.d9i_1; } catch (e4) {}
-      try { rec.hasEntity = b.b9i_1 != null; } catch (e5) {}
-      try { shapes = iterList(b.o9i_1); } catch (e6) { shapes = []; }
-      rec.shapeCount = shapes.length;
-      for (j = 0; j < shapes.length && rec.shapes.length < 8; j++) {
-        rec.shapes.push(describeShape(shapes[j]));
-      }
-      out.push(rec);
-      if (out.length >= 8) break;
-    }
-    return out;
   }
 
     function collectStaticPrimitives(force) {
@@ -1284,7 +1156,7 @@
       if (!isStaticBody(b)) { dynamicCount++; continue; }
       staticCount++;
       shapes = [];
-      try { shapes = iterList(b.o9i_1); } catch (e) { shapes = []; }
+      try { shapes = iterList(b[G.bodyShapes]); } catch (e) { shapes = []; }
       for (j = 0; j < shapes.length; j++) {
         sh = shapes[j];
         if (!isExportableStaticShape(sh)) continue;
@@ -1499,9 +1371,9 @@
       ok: true,
       via: js.via,
       hit: {
-        l9q_1: js.dist,
-        i9q_1: js.name ? { n9j_1: js.name } : null,
-        k9q_1: { f20_1: 0, g20_1: 0, h20_1: js.nz }
+        [G.hitDistance]: js.dist,
+        [G.hitShape]: js.name ? { [G.shapeTag]: js.name } : null,
+        [G.hitNormal]: { [G.x]: 0, [G.y]: 0, [G.z]: js.nz }
       }
     };
   }
@@ -1516,10 +1388,9 @@
     var ok;
     try {
       if (method === "b9m") {
-        // Official static ray: b9m(origin, dir, maxDist, mask, hit [, filter])
         ok = filter
-          ? world.b9m(origin, dir, maxDist, mask, hit, filter)
-          : world.b9m(origin, dir, maxDist, mask, hit);
+          ? world[G.staticRaycast](origin, dir, maxDist, mask, hit, filter)
+          : world[G.staticRaycast](origin, dir, maxDist, mask, hit);
       } else {
         ok = callZ9l(world, origin, dir, maxDist, mask, hit, filter);
       }
@@ -1535,8 +1406,8 @@
     var rec = {
       name: name,
       ok: !!ok,
-      distEngine: (hit && isFiniteNum(hit.l9q_1)) ? hit.l9q_1 : null,
-      distM: (hit && isFiniteNum(hit.l9q_1)) ? toM(hit.l9q_1) : null,
+      distEngine: (hit && isFiniteNum(hit[G.hitDistance])) ? hit[G.hitDistance] : null,
+      distM: (hit && isFiniteNum(hit[G.hitDistance])) ? toM(hit[G.hitDistance]) : null,
       tankish: !!(ok && isTankishHit(hit))
     };
     if (!dbg.attempts) dbg.attempts = [];
@@ -1549,16 +1420,16 @@
     var worlds = getCollisionWorlds();
     if (world && worlds.indexOf(world) < 0) worlds.unshift(world);
     var attempts = [
-      { method: "b9m", name: "b9m+mask16", mask: STATIC_MASK, filter: null },
-      { method: "b9m", name: "b9m+mask16+staticFilter", mask: STATIC_MASK, filter: STATIC_FILTER },
-      { method: "z9l", name: "z9l+mask16+staticFilter", mask: STATIC_MASK, filter: STATIC_FILTER },
-      { method: "z9l", name: "z9l+wide+staticFilter", mask: 0x7fffffff, filter: STATIC_FILTER },
-      { method: "z9l", name: "z9l+wide+noFilter", mask: 0x7fffffff, filter: null }
+      { method: G.staticRaycast, name: "static+mask", mask: STATIC_MASK, filter: null },
+      { method: G.staticRaycast, name: "static+mask+filter", mask: STATIC_MASK, filter: STATIC_FILTER },
+      { method: G.raycast, name: "world+mask+filter", mask: STATIC_MASK, filter: STATIC_FILTER },
+      { method: G.raycast, name: "world+wide+filter", mask: 0x7fffffff, filter: STATIC_FILTER },
+      { method: G.raycast, name: "world+wide", mask: 0x7fffffff, filter: null }
     ];
     var last = { ok: false, hit: null };
     var w, a, i, j, res;
-    dbg.hasB9m = worldHasFn("b9m");
-    dbg.hasZ9l = worldHasFn("z9l");
+    dbg.hasStaticRaycast = worldHasFn(G.staticRaycast);
+    dbg.hasRaycast = worldHasFn(G.raycast);
     dbg.worldsTried = engineRaysOn ? worlds.length : 0;
     dbg.engineRays = engineRaysOn;
     for (i = 0; engineRaysOn && i < worlds.length; i++) {
@@ -1594,9 +1465,6 @@
       dbg.error = dbg.error || "no z9l/b9m on hooked worlds";
     }
     var ox, oy, oz;
-    // Always from tank center (hull position), ~1 m up. Never from the muzzle tip:
-    // a muzzle origin plus a 3 m "too close" skip makes the ray go through a wall
-    // you are already touching.
     ox = engineMe.x;
     oy = engineMe.y;
     oz = engineMe.z + ORIGIN_UP;
@@ -1610,14 +1478,14 @@
     var remaining = RAY_MAX;
     var skips = 0;
     var result = emptyAhead();
-    var last, hx, hy, hz, step, EPS = 10; // 10 cm past a rejected tank hit
+    var last, hx, hy, hz, step, EPS = 10;
     while (remaining > 1 && skips < 5) {
       last = tryCastAt(world, ox, oy, oz, fwd, remaining, dbg);
       result = interpretHit(last.ok, last.hit, dbg, engineMe, ox, oy, oz, fwd, traveled);
       if (result.type != null) return result;
       var canSkip = last.ok && last.hit && isTankishHit(last.hit);
       if (!canSkip) break;
-      step = last.hit.l9q_1;
+      step = last.hit[G.hitDistance];
       if (!isFiniteNum(step) || step < 0) break;
       step = step + EPS;
       ox = ox + fwd.x * step;
@@ -1666,8 +1534,6 @@
     return { hull: hullHit, barrel: barrelHit };
   }
 
-  /* ---------- object-graph scan ---------- */
-
   var SKIP_CTOR = {
     Number: 1, String: 1, Boolean: 1, Symbol: 1, Date: 1, RegExp: 1,
     ArrayBuffer: 1, DataView: 1, Promise: 1, WeakMap: 1, WeakSet: 1,
@@ -1712,21 +1578,21 @@
     } catch (e) {}
   }
 
+  function isPointInitRole(role) {
+    return role === "initPoint" || role === "initNewStylePoint";
+  }
+
   function recordCallable(fn) {
     var name = fn && fn.callableName;
     if (!name || typeof name !== "string") return;
-    if (!foundCallables[name]) foundCallables[name] = 0;
-    foundCallables[name]++;
-    if (!INTERESTING[name]) return;
-    if (hooks[name] === fn) return;
-    if (!OFF.wrapPoint && (name === "initPoint" || name === "initNewStylePoint")) fn = wrapPointInitFn(null, name, fn);
-    hooks[name] = fn;
-    logDebug("hooked " + name + (foundCallables[name] > 1 ? " (replace #" + foundCallables[name] + ")" : " (first)"));
-    if (name === "getLocalTankPosition" || name === "isLocalTankAlive") {
-      logDebug("pos hook ready: " + name);
-    }
+    foundCallables[name] = (foundCallables[name] || 0) + 1;
+    var role = CALLABLE_ROLES[name];
+    if (!role || hooks[role] === fn) return;
+    if (!OFF.wrapPoint && isPointInitRole(role)) fn = wrapPointInitFn(null, name, fn);
+    hooks[role] = fn;
+    logDebug("hooked " + role + (foundCallables[name] > 1 ? " (replace #" + foundCallables[name] + ")" : " (first)"));
   }
-  window.__toCoordsOnCallable = recordCallable;
+
 
   function harvestCallables(root, budget) {
     if (OFF.scan) return;
@@ -1756,8 +1622,8 @@
 
   function rememberBody(obj) {
     try {
-      if (!(obj && obj.v9i_1 && obj.v9i_1.i9j_1 && obj.v9i_1.g9j_1)) return;
-      if (!parseVector3(obj.v9i_1.i9j_1) || !parseQuaternion(obj.v9i_1.g9j_1)) return;
+      if (!(obj && obj[G.bodyState] && obj[G.bodyState][G.position] && obj[G.bodyState][G.orientation])) return;
+      if (!parseVector3(obj[G.bodyState][G.position]) || !parseQuaternion(obj[G.bodyState][G.orientation])) return;
       if (bodyCandidates.indexOf(obj) >= 0) return;
       if (bodyCandidates.length > 80) bodyCandidates.shift();
       bodyCandidates.push(obj);
@@ -1767,13 +1633,13 @@
   function extractWorldFrom(obj) {
     if (!obj) return null;
     try {
-      if (obj.b9i_1 && obj.b9i_1.zz0_1 && typeof obj.b9i_1.zz0_1.z9l === "function") return obj.b9i_1.zz0_1;
+      if (obj[G.bodyOwner] && obj[G.bodyOwner][G.entityWorld] && typeof obj[G.bodyOwner][G.entityWorld][G.raycast] === "function") return obj[G.bodyOwner][G.entityWorld];
     } catch (e) {}
     try {
-      if (obj.zz0_1 && typeof obj.zz0_1.z9l === "function" && obj.zz0_1.z9l.length >= 5) return obj.zz0_1;
+      if (obj[G.entityWorld] && typeof obj[G.entityWorld][G.raycast] === "function" && obj[G.entityWorld][G.raycast].length >= 5) return obj[G.entityWorld];
     } catch (e2) {}
     try {
-      if (typeof obj.z9l === "function" && obj.z9l.length >= 5 && (obj.q9m_1 || obj.w9n_1)) return obj;
+      if (typeof obj[G.raycast] === "function" && obj[G.raycast].length >= 5 && (obj[G.bodies] || obj[G.staticGrid])) return obj;
     } catch (e3) {}
     return null;
   }
@@ -1807,11 +1673,11 @@
     if (obj == null) return null;
     if (typeof obj === "number") return null;
     try {
-      if (isFiniteNum(obj.f20_1) && isFiniteNum(obj.g20_1) && isFiniteNum(obj.h20_1)) {
-        return { x: obj.f20_1, y: obj.g20_1, z: obj.h20_1 };
+      if (isFiniteNum(obj[G.x]) && isFiniteNum(obj[G.y]) && isFiniteNum(obj[G.z])) {
+        return { x: obj[G.x], y: obj[G.y], z: obj[G.z] };
       }
-      if (isFiniteNum(obj.o80_1) && isFiniteNum(obj.p80_1) && isFiniteNum(obj.q80_1)) {
-        return { x: obj.o80_1, y: obj.p80_1, z: obj.q80_1 };
+      if (isFiniteNum(obj[G.mapX]) && isFiniteNum(obj[G.mapY]) && isFiniteNum(obj[G.mapZ])) {
+        return { x: obj[G.mapX], y: obj[G.mapY], z: obj[G.mapZ] };
       }
       if (isFiniteNum(obj.x) && isFiniteNum(obj.y) && isFiniteNum(obj.z)) {
         return { x: obj.x, y: obj.y, z: obj.z };
@@ -1831,16 +1697,16 @@
     if (list == null) return [];
     if (Array.isArray(list)) return list;
     try {
-      if (typeof list.e1 === "function" && typeof list.g1 === "function") {
-        var n = list.e1(), out = [], i;
+      if (typeof list[G.size] === "function" && typeof list[G.get] === "function") {
+        var n = list[G.size](), out = [], i;
         if (typeof n !== "number" || n < 0 || n > 200000) return [];
-        for (i = 0; i < n; i++) out.push(list.g1(i));
+        for (i = 0; i < n; i++) out.push(list[G.get](i));
         return out;
       }
     } catch (e) {}
     try {
       if (typeof list.length === "number" && list.length >= 0 && list.length <= 200000 &&
-          !isFiniteNum(list.f20_1) && !isFiniteNum(list.o80_1)) {
+          !isFiniteNum(list[G.x]) && !isFiniteNum(list[G.mapX])) {
         var arr = [], j;
         for (j = 0; j < list.length; j++) arr.push(list[j]);
         return arr;
@@ -1877,13 +1743,13 @@
   function looksLikeBattleMap(obj) {
     try {
       if (!obj) return false;
-      var cg = obj.b7w_1;
-      if (cg && (cg.u7w_1 != null || cg.v7w_1 != null || cg.w7w_1 != null) && obj.f7w_1 != null) {
+      var cg = obj[G.collisionGeometry];
+      if (cg && (cg[G.boxes] != null || cg[G.planes] != null || cg[G.triangles] != null) && obj[G.staticGeometry] != null) {
         return true;
       }
-      if (typeof obj.g7w === "function" && typeof obj.j7w === "function" && typeof obj.h7w === "function") {
+      if (typeof obj[G.getCollisionGeometry] === "function" && typeof obj[G.getStaticGeometry] === "function" && typeof obj[G.getOutsideGeometry] === "function") {
         try {
-          if (String(obj).indexOf("BattleMap [") === 0) return true;
+          if (String(obj).indexOf(GAME.tags.battleMap) === 0) return true;
         } catch (e) {}
       }
     } catch (e2) {}
@@ -1893,9 +1759,9 @@
   function looksLikeCollisionGeometry(obj) {
     try {
       if (!obj) return false;
-      if (obj.u7w_1 != null || obj.v7w_1 != null || obj.w7w_1 != null) return true;
-      if (typeof obj.x7w === "function" && typeof obj.y7w === "function" && typeof obj.z7w === "function") {
-        try { return String(obj).indexOf("CollisionGeometry [") === 0; } catch (e) {}
+      if (obj[G.boxes] != null || obj[G.planes] != null || obj[G.triangles] != null) return true;
+      if (typeof obj[G.getBoxes] === "function" && typeof obj[G.getPlanes] === "function" && typeof obj[G.getTriangles] === "function") {
+        try { return String(obj).indexOf(GAME.tags.collisionGeometry) === 0; } catch (e) {}
       }
     } catch (e2) {}
     return false;
@@ -1907,16 +1773,15 @@
         hooks.battleMap = obj;
         logDebug("hooked BattleMap");
       }
-      if (!hooks.mapName && typeof obj.ijb_1 === "string" && obj.ijb_1.length > 0 && obj.ijb_1.length < 80 &&
-          (typeof obj.nc1 === "function" || obj.cjb_1 != null)) {
-        hooks.mapName = obj.ijb_1;
+      if (!hooks.mapName && typeof obj[G.mapTitle] === "string" && obj[G.mapTitle].length > 0 && obj[G.mapTitle].length < 80 &&
+          (typeof obj[G.getMapTitle] === "function" || obj[G.mapTitleMarker] != null)) {
+        hooks.mapName = obj[G.mapTitle];
       }
-      if (!hooks.mapName && typeof obj.zib_1 === "string" && obj.zib_1.length > 1 && obj.zib_1.length < 80 &&
-          typeof obj.d8f === "function") {
-        hooks.mapName = obj.zib_1;
+      if (!hooks.mapName && typeof obj[G.battleName] === "string" && obj[G.battleName].length > 1 && obj[G.battleName].length < 80 &&
+          typeof obj[G.getBattleMap] === "function") {
+        hooks.mapName = obj[G.battleName];
       }
-      // Static flag bases only (ClientTeamPoint.flagBasePosition). Never live carriers.
-      if (obj && obj.xin_1 && parseMapVec(obj.xin_1) && obj.zin_1 != null && obj.oir_1 == null) {
+      if (obj && obj[G.teamPointPosition] && parseMapVec(obj[G.teamPointPosition]) && obj[G.teamPointTeam] != null && obj[G.flagCarrierId] == null) {
         if (mapTeamPoints.indexOf(obj) < 0 && mapTeamPoints.length < 32) {
           mapTeamPoints.push(obj);
         }
@@ -1930,38 +1795,35 @@
   function flagStateName(obj) {
     if (!obj) return null;
     try {
-      var st = obj.mir_1;
+      var st = obj[G.flagStatus];
       if (st == null) return null;
       var s = enumName(st) || String(st);
-      if (/AT_BASE/.test(s)) return "AT_BASE";
-      if (/DROPPED|CARRIED|EXILED|FLYING/.test(s)) return s;
+      if (s.indexOf(GAME.flagStates.atBase) >= 0) return GAME.flagStates.atBase;
+      if (GAME.flagStates.away.indexOf(s) >= 0) return s;
     } catch (e) {}
     return null;
   }
 
   function rememberFlagHud(obj) {
-    // FlagState: read only mir_1 (state). Never kir_1 (carrier) or lir_1 (position).
-    if (!obj || obj.mir_1 == null) return;
+    if (!obj || obj[G.flagStatus] == null) return;
     if (flagStateName(obj) == null) return;
     if (flagHudObjs.indexOf(obj) < 0 && flagHudObjs.length < 8) flagHudObjs.push(obj);
   }
 
   function looksLikeClientPointData(obj) {
     if (!obj || typeof obj !== "object") return false;
-    try { if (String(obj).indexOf("ClientPointData") === 0) return true; } catch (e) {}
+    try { if (String(obj).indexOf(GAME.tags.clientPointData) === 0) return true; } catch (e) {}
     try {
-      // ClientPointData: active xii_1, id yii_1, position aij_1 / n7v(), name m().
-      // Never read eij_1 / fij() (tankIds).
-      if (typeof obj.xii_1 === "boolean" && obj.yii_1 != null && (obj.aij_1 || typeof obj.n7v === "function")) return true;
+      if (typeof obj[G.pointActive] === "boolean" && obj[G.pointId] != null && (obj[G.pointPosition] || typeof obj[G.getPosition] === "function")) return true;
     } catch (e2) {}
     return false;
   }
 
   function looksLikeDominationCC(obj) {
     if (!obj || typeof obj !== "object") return false;
-    try { if (String(obj).indexOf("DominationCC") === 0) return true; } catch (e) {}
+    try { if (String(obj).indexOf(GAME.tags.dominationConfig) === 0) return true; } catch (e) {}
     try {
-      if (obj.mii_1 != null && obj.jii_1 != null && obj.kii_1 != null && typeof obj.pii === "function") return true;
+      if (obj[G.dominationPoints] != null && obj[G.dominationA] != null && obj[G.dominationB] != null && typeof obj[G.getDominationPoints] === "function") return true;
     } catch (e2) {}
     return false;
   }
@@ -2006,40 +1868,37 @@
 
   function rememberControlPoint(obj) {
     if (!obj || typeof obj !== "object") return;
-    try { if (obj.oir_1 != null) return; } catch (eSkip) {}
+    try { if (obj[G.flagCarrierId] != null) return; } catch (eSkip) {}
     var i, list, pos, name, id, letter;
     if (looksLikeDominationCC(obj)) {
       list = [];
-      try { list = iterList(typeof obj.pii === "function" ? obj.pii() : obj.mii_1); } catch (eL) { list = []; }
+      try { list = iterList(typeof obj[G.getDominationPoints] === "function" ? obj[G.getDominationPoints]() : obj[G.dominationPoints]); } catch (eL) { list = []; }
       logDebug("DominationCC points=" + list.length);
       for (i = 0; i < list.length; i++) rememberControlPoint(list[i]);
       return;
     }
     if (looksLikeClientPointData(obj)) {
       pos = null;
-      try { if (typeof obj.n7v === "function") pos = vecToM(parseMapVec(obj.n7v())); } catch (eP) {}
-      if (!pos) { try { pos = vecToM(parseMapVec(obj.aij_1)); } catch (eP2) {} }
+      try { if (typeof obj[G.getPosition] === "function") pos = vecToM(parseMapVec(obj[G.getPosition]())); } catch (eP) {}
+      if (!pos) { try { pos = vecToM(parseMapVec(obj[G.pointPosition])); } catch (eP2) {} }
       name = "";
-      // name via m(); never fij()/eij_1 tankIds
-      try { if (typeof obj.m === "function") name = String(obj.m() || ""); } catch (eN) {}
-      try { id = obj.yii_1; } catch (eI) { id = null; }
+      try { if (typeof obj[G.getName] === "function") name = String(obj[G.getName]() || ""); } catch (eN) {}
+      try { id = obj[G.pointId]; } catch (eI) { id = null; }
       letter = letterFromPointMeta(name, id);
       rememberControlPointAt(pos, letter, name || letter);
     }
-    // No guessing from names: anything with a position and a one-letter name
-    // used to become a "control point" (props, spawns...).
   }
 
   function capturePointFromInitArgs(args) {
     var n = args && (args.length > 1 ? args[1] : args[0]);
     if (!n || typeof n !== "object") return;
-    var rec = n.o13j_1 || n.r13j_1;
+    var rec = n[G.initPointRecord] || n[G.initPointRecordAlt];
     if (!rec) return;
     var pos = null, id = null, name = "";
-    try { id = rec.yin_1; } catch (e) {}
+    try { id = rec[G.recordId]; } catch (e) {}
     try {
-      var tr = (typeof rec.aio === "function") ? rec.aio() : rec;
-      var raw = (tr && typeof tr.d21 === "function") ? tr.d21() : tr;
+      var tr = (typeof rec[G.getTransform] === "function") ? rec[G.getTransform]() : rec;
+      var raw = (tr && typeof tr[G.clone] === "function") ? tr[G.clone]() : tr;
       pos = vecToM(parseMapVec(raw));
     } catch (e2) {}
     try { name = id != null && id.toString ? String(id.toString()) : String(id || ""); } catch (e3) { name = String(id || ""); }
@@ -2077,7 +1936,7 @@
 
   function flagTeamOf(obj) {
     try {
-      return normalizeTeam(enumName(obj.zin_1) || enumName(obj.win_1) || enumName(obj.teamType) || enumName(obj.team));
+      return normalizeTeam(enumName(obj[G.teamPointTeam]) || enumName(obj[G.teamPointTeamAlt]) || enumName(obj.teamType) || enumName(obj.team));
     } catch (e) { return null; }
   }
 
@@ -2089,7 +1948,7 @@
         st = flagStateName(obj);
         team = flagTeamOf(obj);
         if (!team || !st) continue;
-        next[team] = st !== "AT_BASE";
+        next[team] = st !== GAME.flagStates.atBase;
       } catch (e) {}
     }
     flagTaken = next;
@@ -2125,33 +1984,24 @@
     return out;
   }
 
-  function rotateEuler(v, e) {
-    if (!v) return v;
-    if (!e) return { x: v.x, y: v.y, z: v.z };
-    var cx = Math.cos(e.x), sx = Math.sin(e.x);
-    var cy = Math.cos(e.y), sy = Math.sin(e.y);
-    var cz = Math.cos(e.z), sz = Math.sin(e.z);
-    var y1 = v.y * cx - v.z * sx, z1 = v.y * sx + v.z * cx;
-    var x2 = v.x * cy + z1 * sy, z2 = -v.x * sy + z1 * cy;
-    return { x: x2 * cz - y1 * sz, y: x2 * sz + y1 * cz, z: z2 };
-  }
+  function rotateEuler(v, e) { return TOC.geometry.rotateEuler(v, e); }
 
-  function add3(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+  function add3(a, b) { return TOC.geometry.add3(a, b); }
 
   function exportBox(box) {
-    var pos = vecToM(parseMapVec(box && (box.n7w_1 || (typeof box.n7v === "function" && box.n7v()))));
-    var rot = parseMapVec(box && (box.o7w_1 || (typeof box.q7w === "function" && box.q7w())));
-    var sizeRaw = parseMapVec(box && (box.p7w_1 || (typeof box.e1 === "function" && box.e1())));
+    var pos = vecToM(parseMapVec(box && (box[G.boxPosition] || (typeof box[G.getPosition] === "function" && box[G.getPosition]()))));
+    var rot = parseMapVec(box && (box[G.boxRotation] || (typeof box[G.getRotation] === "function" && box[G.getRotation]())));
+    var sizeRaw = parseMapVec(box && (box[G.boxSize] || (typeof box[G.size] === "function" && box[G.size]())));
     if (!pos || !sizeRaw) return null;
     var size = vecToM(sizeRaw);
     return { type: "box", position: pos, rotation: rot, size: size };
   }
 
   function exportPlane(plane) {
-    var pos = vecToM(parseMapVec(plane && (plane.d7x_1 || (typeof plane.n7v === "function" && plane.n7v()))));
-    var rot = parseMapVec(plane && (plane.e7x_1 || (typeof plane.q7w === "function" && plane.q7w())));
+    var pos = vecToM(parseMapVec(plane && (plane[G.planePosition] || (typeof plane[G.getPosition] === "function" && plane[G.getPosition]()))));
+    var rot = parseMapVec(plane && (plane[G.planeRotation] || (typeof plane[G.getRotation] === "function" && plane[G.getRotation]())));
     if (!pos) return null;
-    var length = plane.c7x_1, width = plane.f7x_1;
+    var length = plane[G.planeLength], width = plane[G.planeWidth];
     return {
       type: "plane",
       position: pos,
@@ -2162,11 +2012,11 @@
   }
 
   function exportTriangle(tri) {
-    var pos = vecToM(parseMapVec(tri && (tri.m7x_1 || (typeof tri.n7v === "function" && tri.n7v()))));
-    var rot = parseMapVec(tri && (tri.n7x_1 || (typeof tri.q7w === "function" && tri.q7w())));
-    var v0 = vecToM(parseMapVec(tri && (tri.o7x_1 || (typeof tri.r7x === "function" && tri.r7x()))));
-    var v1 = vecToM(parseMapVec(tri && (tri.p7x_1 || (typeof tri.s7x === "function" && tri.s7x()))));
-    var v2 = vecToM(parseMapVec(tri && (tri.q7x_1 || (typeof tri.t7x === "function" && tri.t7x()))));
+    var pos = vecToM(parseMapVec(tri && (tri[G.trianglePosition] || (typeof tri[G.getPosition] === "function" && tri[G.getPosition]()))));
+    var rot = parseMapVec(tri && (tri[G.triangleRotation] || (typeof tri[G.getRotation] === "function" && tri[G.getRotation]())));
+    var v0 = vecToM(parseMapVec(tri && (tri[G.vertex0] || (typeof tri[G.getVertex0] === "function" && tri[G.getVertex0]()))));
+    var v1 = vecToM(parseMapVec(tri && (tri[G.vertex1] || (typeof tri[G.getVertex1] === "function" && tri[G.getVertex1]()))));
+    var v2 = vecToM(parseMapVec(tri && (tri[G.vertex2] || (typeof tri[G.getVertex2] === "function" && tri[G.getVertex2]()))));
     if (!v0 || !v1 || !v2) return null;
     var w0 = pos ? add3(pos, rotateEuler(v0, rot)) : v0;
     var w1 = pos ? add3(pos, rotateEuler(v1, rot)) : v1;
@@ -2183,9 +2033,9 @@
   function exportCollisionGeometry(cg) {
     var boxes = [], planes = [], triangles = [], i, item;
     if (!cg) return { boxes: boxes, planes: planes, triangles: triangles };
-    var boxList = unwrapList(typeof cg.x7w === "function" ? cg.x7w() : cg.u7w_1, ["u7w_1"]);
-    var planeList = unwrapList(typeof cg.y7w === "function" ? cg.y7w() : cg.v7w_1, ["v7w_1"]);
-    var triList = unwrapList(typeof cg.z7w === "function" ? cg.z7w() : cg.w7w_1, ["w7w_1"]);
+    var boxList = unwrapList(typeof cg[G.getBoxes] === "function" ? cg[G.getBoxes]() : cg[G.boxes], [G.boxes]);
+    var planeList = unwrapList(typeof cg[G.getPlanes] === "function" ? cg[G.getPlanes]() : cg[G.planes], [G.planes]);
+    var triList = unwrapList(typeof cg[G.getTriangles] === "function" ? cg[G.getTriangles]() : cg[G.triangles], [G.triangles]);
     for (i = 0; i < boxList.length; i++) {
       item = exportBox(boxList[i]);
       if (item) boxes.push(item);
@@ -2204,14 +2054,14 @@
   function exportProp(prop) {
     if (!prop) return null;
     var name = null, groupName = null, libraryName = null;
-    try { name = prop.y7y_1 || (typeof prop.m === "function" ? prop.m() : null); } catch (e) {}
-    try { groupName = prop.u7y_1 || null; } catch (e2) {}
-    try { libraryName = prop.w7y_1 || (typeof prop.c7v === "function" ? prop.c7v() : null); } catch (e3) {}
+    try { name = prop[G.propName] || (typeof prop[G.getName] === "function" ? prop[G.getName]() : null); } catch (e) {}
+    try { groupName = prop[G.propGroup] || null; } catch (e2) {}
+    try { libraryName = prop[G.propLibrary] || (typeof prop[G.getLibrary] === "function" ? prop[G.getLibrary]() : null); } catch (e3) {}
     if (typeof name !== "string") name = name != null ? String(name) : null;
     if (name && /hull|turret|chassis|tank|bonus|mine|shell|player/i.test(name)) return null;
-    var pos = vecToM(parseMapVec(prop.z7y_1 || (typeof prop.n7v === "function" && prop.n7v())));
-    var rot = parseMapVec(prop.a7z_1);
-    var scale = parseMapVec(prop.b7z_1);
+    var pos = vecToM(parseMapVec(prop[G.propPosition] || (typeof prop[G.getPosition] === "function" && prop[G.getPosition]())));
+    var rot = parseMapVec(prop[G.propRotation]);
+    var scale = parseMapVec(prop[G.propScale]);
     if (!pos && !name) return null;
     var size = null;
     if (scale) {
@@ -2231,12 +2081,12 @@
 
   function exportSpawn(sp) {
     if (!sp) return null;
-    var pos = vecToM(parseMapVec(sp.m7z_1 || (typeof sp.n7v === "function" && sp.n7v())));
+    var pos = vecToM(parseMapVec(sp[G.spawnPosition] || (typeof sp[G.getPosition] === "function" && sp[G.getPosition]())));
     if (!pos) return null;
     return {
       position: pos,
-      rotation: parseMapVec(sp.n7z_1 || (typeof sp.q7w === "function" && sp.q7w())),
-      type: enumName(sp.o7z_1)
+      rotation: parseMapVec(sp[G.spawnRotation] || (typeof sp[G.getRotation] === "function" && sp[G.getRotation]())),
+      type: enumName(sp[G.spawnType])
     };
   }
 
@@ -2245,47 +2095,7 @@
     return s || "map";
   }
 
-  function collectBounds(data) {
-    var minX = Infinity, minY = Infinity, minZ = Infinity;
-    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    function acc(v) {
-      if (!v || !isFiniteNum(v.x)) return;
-      if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
-      if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
-      if (v.z < minZ) minZ = v.z; if (v.z > maxZ) maxZ = v.z;
-    }
-    function accBox(b) {
-      if (!b || !b.position || !b.size) return acc(b && b.position);
-      var hx = Math.abs(b.size.x) / 2, hy = Math.abs(b.size.y) / 2, hz = Math.abs(b.size.z) / 2;
-      var sx, sy, sz, c;
-      for (sx = -1; sx <= 1; sx += 2)
-        for (sy = -1; sy <= 1; sy += 2)
-          for (sz = -1; sz <= 1; sz += 2) {
-            c = rotateEuler({ x: sx * hx, y: sy * hy, z: sz * hz }, b.rotation);
-            acc(add3(b.position, c));
-          }
-    }
-    var i, g, list, item;
-    function walkGeom(g) {
-      if (!g) return;
-      for (i = 0; i < g.boxes.length; i++) accBox(g.boxes[i]);
-      for (i = 0; i < g.planes.length; i++) acc(g.planes[i].position);
-      for (i = 0; i < g.triangles.length; i++) {
-        item = g.triangles[i];
-        if (item.world) { acc(item.world[0]); acc(item.world[1]); acc(item.world[2]); }
-      }
-    }
-    walkGeom(data.collision);
-    walkGeom(data.collisionOutside);
-    for (i = 0; i < data.props.length; i++) acc(data.props[i].position);
-    for (i = 0; i < data.spawns.length; i++) acc(data.spawns[i].position);
-    for (i = 0; i < data.bases.length; i++) acc(data.bases[i].position);
-    if (data.objectives) {
-      for (i = 0; i < data.objectives.length; i++) acc(data.objectives[i].position);
-    }
-    if (!isFinite(minX)) return null;
-    return { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } };
-  }
+  function collectBounds(data) { return TOC.geometry.collectBounds(data); }
 
   function downloadJson(filename, data) {
     var blob = new Blob([JSON.stringify(data)], { type: "application/json" });
@@ -2311,18 +2121,18 @@
 
     var source = "battleMap";
     if (map) {
-      try { cg = map.b7w_1 || (typeof map.g7w === "function" && map.g7w()); } catch (e) { cg = null; }
-      try { outside = map.c7w_1 || (typeof map.h7w === "function" && map.h7w()); } catch (e2) { outside = null; }
-      try { sg = map.f7w_1 || (typeof map.j7w === "function" && map.j7w()); } catch (e3) { sg = null; }
+      try { cg = map[G.collisionGeometry] || (typeof map[G.getCollisionGeometry] === "function" && map[G.getCollisionGeometry]()); } catch (e) { cg = null; }
+      try { outside = map[G.outsideGeometry] || (typeof map[G.getOutsideGeometry] === "function" && map[G.getOutsideGeometry]()); } catch (e2) { outside = null; }
+      try { sg = map[G.staticGeometry] || (typeof map[G.getStaticGeometry] === "function" && map[G.getStaticGeometry]()); } catch (e3) { sg = null; }
       if (cg) collision = exportCollisionGeometry(cg);
       if (outside) collisionOutside = exportCollisionGeometry(outside);
-      list = unwrapList(sg && (typeof sg.u7z === "function" ? sg.u7z() : sg.t7z_1), ["t7z_1"]);
+      list = unwrapList(sg && (typeof sg[G.getProps] === "function" ? sg[G.getProps]() : sg[G.propList]), [G.propList]);
       for (i = 0; i < list.length; i++) {
         item = exportProp(list[i]);
         if (item) props.push(item);
       }
-      list = unwrapList(map.e7w_1 && (typeof map.e7w_1.r7z === "function" ? map.e7w_1.r7z() : map.e7w_1.q7z_1), ["q7z_1", "e7w_1"]);
-      if (!list.length) list = unwrapList(map.e7w_1, ["q7z_1"]);
+      list = unwrapList(map[G.spawnSet] && (typeof map[G.spawnSet][G.getSpawns] === "function" ? map[G.spawnSet][G.getSpawns]() : map[G.spawnSet][G.spawnList]), [G.spawnList, G.spawnSet]);
+      if (!list.length) list = unwrapList(map[G.spawnSet], [G.spawnList]);
       for (i = 0; i < list.length; i++) {
         item = exportSpawn(list[i]);
         if (item) spawns.push(item);
@@ -2340,13 +2150,13 @@
     for (i = 0; i < mapTeamPoints.length; i++) {
       try {
         item = mapTeamPoints[i];
-        if (item.oir_1 != null) continue;
-        var pos = vecToM(parseMapVec(item.xin_1));
+        if (item[G.flagCarrierId] != null) continue;
+        var pos = vecToM(parseMapVec(item[G.teamPointPosition]));
         if (!pos) continue;
         bases.push({
           position: pos,
-          teamType: enumName(item.zin_1),
-          id: item.yin_1 != null ? item.yin_1 : null
+          teamType: enumName(item[G.teamPointTeam]),
+          id: item[G.recordId] != null ? item[G.recordId] : null
         });
       } catch (e4) {}
     }
@@ -2393,8 +2203,8 @@
     if (nPrim === 0) {
       var err = {
         ok: false,
-        error: "Статику карты не нашла (ни BattleMap, ни тела physicsWorld). Кинь toCoords.mapDebug().",
-        mapDebug: mapDebug()
+        error: "Статику карты не нашла (ни BattleMap, ни тела physicsWorld).",
+        status: status()
       };
       lastMapExport = err;
       console.warn("[toCoords.exportMap]", err);
@@ -2416,70 +2226,6 @@
     return result;
   }
 
-  function mapDebug() {
-    var prims = collectStaticPrimitives(true);
-    function sample(list, n) {
-      var out = [], i, it, s;
-      for (i = 0; i < list.length && out.length < n; i++) {
-        it = list[i];
-        s = { type: it.type || it.kind };
-        if (it.position) s.position = it.position;
-        if (it.size) s.size = it.size;
-        if (it.name) s.name = it.name;
-        if (it.world) s.world0 = it.world[0];
-        out.push(s);
-      }
-      return out;
-    }
-    var typeHist = {}, groupHist = {}, accelShapes, i, typ;
-    try {
-      accelShapes = collectStaticShapes();
-      for (i = 0; i < accelShapes.shapes.length; i++) {
-        typ = String(accelShapes.shapes[i].l9j_1);
-        typeHist[typ] = (typeHist[typ] || 0) + 1;
-        typ = String(accelShapes.shapes[i].p9j_1);
-        groupHist[typ] = (groupHist[typ] || 0) + 1;
-      }
-    } catch (eAcc) { accelShapes = { shapes: [], stats: { error: String(eAcc && eAcc.message || eAcc) } }; }
-    var payload = {
-      battleMap: !!hooks.battleMap,
-      mapName: hooks.mapName || "unknown",
-      worlds: getCollisionWorlds().length,
-      hasB9m: worldHasFn("b9m"),
-      hasZ9l: worldHasFn("z9l"),
-      hasJ9o: worldHasFn("j9o"),
-      bodyListSize: prims.bodyListSize,
-      staticBodies: prims.staticBodies,
-      dynamicSkipped: prims.dynamicBodies,
-      staticBodyDetails: (function () { try { return describeStaticBodies(listAllBodies()); } catch (e) { return []; } })(),
-      accel: accelShapes.stats,
-      accelShapeCount: accelShapes.shapes.length,
-      accelTypeHist: typeHist,
-      accelGroupHist: groupHist,
-      sampleAccelShapes: (function () {
-        var out = [], k;
-        for (k = 0; k < accelShapes.shapes.length && out.length < 8; k++) out.push(describeShape(accelShapes.shapes[k]));
-        return out;
-      })(),
-      primitives: {
-        boxes: prims.boxes.length,
-        planes: prims.planes.length,
-        triangles: prims.triangles.length
-      },
-      sampleBoxes: sample(prims.boxes, 5),
-      samplePlanes: sample(prims.planes, 3),
-      sampleTriangles: sample(prims.triangles, 5),
-      note: "Только статика. Тела с ECS-сущностью (танки и т.п.) не входят. Сетка b9m — zi.w9n_1 / v9n_1."
-    };
-    try {
-      if (mapCache.data) payload.minimapSurfaces = collectMinimapSurfaces(mapCache.data).stats;
-    } catch (eSurf) { payload.minimapSurfacesError = String(eSurf && eSurf.message || eSurf); }
-    payload.controlPoints = mapControlPoints.map(function (c) { return { letter: c.letter, x: c.position && c.position.x, y: c.position && c.position.y }; });
-    payload.objectives = (mapCache.data && mapCache.data.objectives) || [];
-    console.log("[toCoords.mapDebug]", payload);
-    return payload;
-  }
-
   var capturedListeners = [];
   var capturedListenerSet = typeof Set === "function" ? new Set() : null;
   var scanCursor = { queue: null, seen: null };
@@ -2489,27 +2235,15 @@
   var burstFramesLeft = 0;
   var lastBurstAt = 0;
   var SCAN_SKIP_KEYS = {
-    w9n_1: 1, v9n_1: 1, u9n_1: 1, y9n_1: 1, l9p_1: 1, f9q_1: 1, w9q_1: 1,
-    q9m_1: 1, o9i_1: 1, a9o_1: 1, p102_1: 1,
-    kir_1: 1, lir_1: 1, flagCarrierId: 1, flagPosition: 1
+    [G.staticGrid]: 1, [G.staticTree]: 1, [G.bulkListA]: 1, [G.bulkListB]: 1, [G.gridCells]: 1, [G.cellShapes]: 1, [G.nodeShapes]: 1,
+    [G.bodies]: 1, [G.bodyShapes]: 1, [G.bulkListC]: 1, [G.mapCollision]: 1,
+    [G.flagCarrierCodec]: 1, [G.flagPositionCodec]: 1, flagCarrierId: 1, flagPosition: 1
   };
-  var MINIMAP_ID = "to-coords-minimap";
-  var MINIMAP_SIZE = 300;
   var COS35 = Math.cos(35 * Math.PI / 180);
   var TANK_WIDTH_M = 3.5;
-  var nextMinimapAt = 0;
   var nextLiveWalkAt = 0;
   var nextTreesAt = 0;
-  var minimapCostMs = 0; // running average of drawMinimap() time
-  function minimapFrame(now) {
-    if (!minimap.on || now < nextMinimapAt) return;
-    var t0 = performance.now();
-    try { drawMinimap(); } catch (eMin) {}
-    var dt = performance.now() - t0;
-    minimapCostMs = minimapCostMs ? minimapCostMs * 0.9 + dt * 0.1 : dt;
-    // every frame while it costs < 3 ms, otherwise 30 / 15 fps
-    nextMinimapAt = now + (minimapCostMs < 3 ? 0 : (minimapCostMs < 8 ? 33 : 66));
-  }
+
   var mapCache = {
     data: null,
     jsPrims: null,
@@ -2520,186 +2254,165 @@
     started: false,
     status: "",
     building: false,
-    native: null,
-    texture: null,
-    textureId: null
+    native: null
   };
   var flagHudObjs = [];
   var flagTaken = {};
   var mapControlPoints = [];
 
-  /* ---------- live control points (what the game's CP HUD shows) ----------
-   * Runtime point object: name r11f_1, position s11f_1, owner y11f_1
-   * (TEAM_A / TEAM_B / NEUTRAL), shown score a11g_1 (-100..100, the sign is the
-   * side that is capturing), active d11g_1, battle teams x11f_1 (our team l10b_1).
-   * Tank lists / counts on the point are not read. */
   var cpLive = [];
-  var cpSign = { pos: "TEAM_B", neg: "TEAM_A" }; // game: score > 0 means TEAM_B
+  var cpSign = { pos: GAME.teams.b, neg: GAME.teams.a };
   function looksLikeCpRuntime(obj) {
     try {
       return !!(obj && typeof obj === "object" &&
-        typeof obj.a11g_1 === "number" && typeof obj.z11f_1 === "number" && typeof obj.b11g_1 === "number" &&
-        obj.y11f_1 && typeof obj.y11f_1 === "object" &&
-        typeof obj.r11f_1 === "string" && obj.s11f_1 && typeof obj.s11f_1 === "object");
+        typeof obj[G.cpScore] === "number" && typeof obj[G.cpServerScore] === "number" && typeof obj[G.cpScoreRate] === "number" &&
+        obj[G.cpOwner] && typeof obj[G.cpOwner] === "object" &&
+        typeof obj[G.cpName] === "string" && obj[G.cpPosition] && typeof obj[G.cpPosition] === "object");
     } catch (e) { return false; }
   }
   function rememberCpRuntime(obj) {
     if (!looksLikeCpRuntime(obj) || cpLive.indexOf(obj) >= 0 || cpLive.length >= 16) return false;
     cpLive.push(obj);
-    logDebug("cp live " + obj.r11f_1 + " (" + cpLive.length + ")");
-    // the other points hang off the same battle world: look there right away
-    if (!bfsScan.busy) { try { walkBattleWorld(obj.t11f_1, 6); } catch (e) {} }
+    logDebug("cp live " + obj[G.cpName] + " (" + cpLive.length + ")");
+    if (!bfsScan.busy) { try { walkBattleWorld(obj[G.cpWorld], 6); } catch (e) {} }
     return true;
   }
   function enumStr(v) {
     try { return v == null ? "" : String(v); } catch (e) { return ""; }
   }
-  function otherTeam(t) { return t === "TEAM_A" ? "TEAM_B" : "TEAM_A"; }
+  function otherTeam(t) { return t === GAME.teams.a ? GAME.teams.b : GAME.teams.a; }
   function cpLiveStates() {
     var out = [], i, pt, pos, owner, score, local, name;
     for (i = 0; i < cpLive.length; i++) {
       pt = cpLive[i];
-      if (hooks.physicsWorld && pt.t11f_1 && pt.t11f_1 !== hooks.physicsWorld && pt.t11f_1.zyv_1 !== hooks.physicsWorld) continue;
+      if (hooks.physicsWorld && pt[G.cpWorld] && pt[G.cpWorld] !== hooks.physicsWorld && pt[G.cpWorld][G.physics] !== hooks.physicsWorld) continue;
       pos = null;
-      try { pos = vecToM(parseMapVec(pt.s11f_1)); } catch (e) {}
+      try { pos = vecToM(parseMapVec(pt[G.cpPosition])); } catch (e) {}
       if (!pos || !isFiniteNum(pos.x)) continue;
-      owner = enumStr(pt.y11f_1);
-      score = isFiniteNum(pt.a11g_1) ? Math.max(-100, Math.min(100, pt.a11g_1)) : 0;
-      // A fully held point tells us which sign belongs to which team.
-      if ((owner === "TEAM_A" || owner === "TEAM_B") && Math.abs(score) >= 99.5) {
+      owner = enumStr(pt[G.cpOwner]);
+      score = isFiniteNum(pt[G.cpScore]) ? Math.max(-100, Math.min(100, pt[G.cpScore])) : 0;
+      if ((owner === GAME.teams.a || owner === GAME.teams.b) && Math.abs(score) >= 99.5) {
         if (score > 0) { cpSign.pos = owner; cpSign.neg = otherTeam(owner); }
         else { cpSign.neg = owner; cpSign.pos = otherTeam(owner); }
       }
       local = "";
-      try { local = enumStr(pt.x11f_1 && pt.x11f_1.l10b_1); } catch (e2) {}
-      name = pt.r11f_1 || "";
+      try { local = enumStr(pt[G.cpTeams] && pt[G.cpTeams][G.ourTeam]); } catch (e2) {}
+      name = pt[G.cpName] || "";
       out.push({
         pos: pos,
         letter: letterFromPointMeta(name, null) || (name ? name.charAt(0).toUpperCase() : "?"),
-        owner: owner === "TEAM_A" || owner === "TEAM_B" ? owner : null,
+        owner: owner === GAME.teams.a || owner === GAME.teams.b ? owner : null,
         score: score,
         capTeam: score > 0 ? cpSign.pos : (score < 0 ? cpSign.neg : null),
         local: local,
-        active: pt.d11g_1 !== false
+        active: pt[G.cpActive] !== false
       });
     }
     return out;
   }
-  /* ---------- live CTF flags (what the game's flag markers show) ----------
-   * Flag object: state z133_1 (AT_BASE / DROPPED / CARRIED / EXILED / FLYING),
-   * team u133_1, battle teams q13b_1 (our team l10b_1), screen marker t13b_1
-   * (hOt: position r133_1 = flag + 3 m, rule k133_1(pos) = isFlagMarkerVisible).
-   * The marker rule is the game's own: carried/dropped flag farther than 75 m
-   * from the camera (or a highlighted carrier). We show a flag only when that
-   * rule says the game shows its marker. The carrier id is not read. */
   var flagLive = [];
   function looksLikeFlagObj(obj) {
     try {
-      var m = obj && obj.t13b_1;
-      return !!(m && typeof m === "object" && m.r133_1 && typeof m.k133_1 === "function" &&
-        obj.z133_1 && typeof obj.z133_1 === "object" && obj.u133_1 && typeof obj.u133_1 === "object");
+      var m = obj && obj[G.flagMarker];
+      return !!(m && typeof m === "object" && m[G.markerPosition] && typeof m[G.markerRule] === "function" &&
+        obj[G.flagState] && typeof obj[G.flagState] === "object" && obj[G.flagTeam] && typeof obj[G.flagTeam] === "object");
     } catch (e) { return false; }
   }
   function rememberFlagObj(obj) {
     if (!looksLikeFlagObj(obj) || flagLive.indexOf(obj) >= 0 || flagLive.length >= 6) return;
     flagLive.push(obj);
-    logDebug("flag live " + enumStr(obj.u133_1) + " " + enumStr(obj.z133_1));
+    logDebug("flag live " + enumStr(obj[G.flagTeam]) + " " + enumStr(obj[G.flagState]));
   }
   function flagLiveStates() {
     var out = [], i, f, m, pos, st, shown;
     for (i = 0; i < flagLive.length; i++) {
       f = flagLive[i];
       try {
-        if (hooks.physicsWorld && f.v133_1 && f.v133_1 !== hooks.physicsWorld && f.v133_1.zyv_1 !== hooks.physicsWorld) continue;
-        m = f.t13b_1;
-        st = enumStr(f.z133_1);
-        if (st !== "CARRIED" && st !== "DROPPED") continue;
+        if (hooks.physicsWorld && f[G.flagWorld] && f[G.flagWorld] !== hooks.physicsWorld && f[G.flagWorld][G.physics] !== hooks.physicsWorld) continue;
+        m = f[G.flagMarker];
+        st = enumStr(f[G.flagState]);
+        if (st !== GAME.flagStates.carried && st !== GAME.flagStates.dropped) continue;
         shown = false;
-        try { shown = !!m.k133_1(m.r133_1); } catch (eV) { shown = false; }
+        try { shown = !!m[G.markerRule](m[G.markerPosition]); } catch (eV) { shown = false; }
         if (!shown) continue;
-        pos = vecToM(parseMapVec(m.r133_1));
+        pos = vecToM(parseMapVec(m[G.markerPosition]));
         if (!pos) continue;
-        out.push({ key: f, pos: pos, state: st, team: enumStr(f.u133_1), local: enumStr(f.q13b_1 && f.q13b_1.l10b_1) });
+        out.push({ key: f, pos: pos, state: st, team: enumStr(f[G.flagTeam]), local: enumStr(f[G.flagTeams] && f[G.flagTeams][G.ourTeam]) });
       } catch (e) {}
     }
     return out;
   }
 
-  /* ---------- battle format (parkour) ----------
-   * Battle parameters object: typed slots { gzl_1: name, hzl_1: value }, one of
-   * them is "parkourMode" (the game's own flag for the parkour format). */
   var battleParams = null;
   function rememberBattleParams(obj) {
     try {
-      if (obj && obj.qzd_1 && obj.qzd_1.gzl_1 === "parkourMode" && obj.pzd_1 && obj.pzd_1.gzl_1 === "spectatorMode") {
-        if (battleParams !== obj) { battleParams = obj; logDebug("battle params found, parkour=" + obj.qzd_1.hzl_1); }
+      if (obj && obj[G.parkourSlot] && obj[G.parkourSlot][G.slotName] === "parkourMode" && obj[G.spectatorSlot] && obj[G.spectatorSlot][G.slotName] === "spectatorMode") {
+        if (battleParams !== obj) { battleParams = obj; logDebug("battle params found, parkour=" + obj[G.parkourSlot][G.slotValue]); }
       }
     } catch (e) {}
   }
-  // BattlefieldCC (battle data: customBattleName zib_1, formatName bic_1,
-  // parkourMode hic_1, map d8f()) — found by the ordinary scan.
   var battlefieldCC = null;
   function rememberBattlefieldCC(obj) {
     try {
-      if (obj && typeof obj.d8f === "function" && typeof obj.hic_1 === "boolean" && "bic_1" in obj && "zib_1" in obj) {
+      if (obj && typeof obj[G.getBattleMap] === "function" && typeof obj[G.parkourMode] === "boolean" && G.formatName in obj && G.battleName in obj) {
         if (battlefieldCC !== obj) {
           battlefieldCC = obj;
-          logDebug("battle data found, format=" + obj.bic_1 + " parkour=" + obj.hic_1);
+          logDebug("battle data found, format=" + obj[G.formatName] + " parkour=" + obj[G.parkourMode]);
         }
       }
     } catch (e) {}
   }
-  // Battle map component (j8): b103(..., parkourMode, ...) stores it in m102_1
-  // (in parkour the game also makes the out-of-map geometry solid).
   var mapComp = null;
   function rememberMapComp(obj) {
     try {
-      if (obj && typeof obj.m102_1 === "boolean" && typeof obj.h10y === "function" && obj.p102_1 && obj.o102_1) {
-        if (mapComp !== obj) { mapComp = obj; logDebug("battle map component found, parkour=" + obj.m102_1); }
+      if (obj && typeof obj[G.parkourGeometry] === "boolean" && typeof obj[G.getDustSettings] === "function" && obj[G.mapCollision] && obj[G.mapLighting]) {
+        if (mapComp !== obj) { mapComp = obj; logDebug("battle map component found, parkour=" + obj[G.parkourGeometry]); }
       }
     } catch (e) {}
   }
   function parkourKnown() { return !!(battleParams || battlefieldCC || mapComp); }
   function battleFormatName() {
-    try { if (battlefieldCC) return String(battlefieldCC.bic_1); } catch (e) {}
-    if (mapComp) return mapComp.m102_1 ? "паркур" : "не паркур";
-    if (battleParams) return battleParams.qzd_1 && battleParams.qzd_1.hzl_1 ? "паркур" : "не паркур";
+    try { if (battlefieldCC) return String(battlefieldCC[G.formatName]); } catch (e) {}
+    if (mapComp) return mapComp[G.parkourGeometry] ? "паркур" : "не паркур";
+    if (battleParams) return battleParams[G.parkourSlot] && battleParams[G.parkourSlot][G.slotValue] ? "паркур" : "не паркур";
     return "?";
   }
   function isParkour() {
-    try { if (battleParams && battleParams.qzd_1 && battleParams.qzd_1.hzl_1 === true) return true; } catch (e) {}
-    try { if (battlefieldCC && (battlefieldCC.hic_1 === true || /PARKOUR|ПАРКУР/i.test(String(battlefieldCC.bic_1)))) return true; } catch (e2) {}
-    try { if (mapComp && mapComp.m102_1 === true) return true; } catch (e3) {}
+    try { if (battleParams && battleParams[G.parkourSlot] && battleParams[G.parkourSlot][G.slotValue] === true) return true; } catch (e) {}
+    try { if (battlefieldCC && (battlefieldCC[G.parkourMode] === true || GAME.parkourFormat.test(String(battlefieldCC[G.formatName])))) return true; } catch (e2) {}
+    try { if (mapComp && mapComp[G.parkourGeometry] === true) return true; } catch (e3) {}
     return false;
   }
 
-  /* ---------- parkour: no trees / bushes ----------
-   * The map component keeps the vegetation in three lists: s102_1 = flat
-   * sprite bushes (lowest "trees quality"), u102_1 / w102_1 = 3D trees. The
-   * game's own quality switch shows/hides them with p3k(visible); m3k() reads
-   * it. In parkour we hide all three and give the old visibility back after. */
-  var treesHidden = []; // { o: object, was: boolean }
+  var treesHidden = [];
   function treeObjects() {
     var out = [], lists, i, j, arr;
     if (!mapComp) return out;
-    lists = [mapComp.s102_1, mapComp.u102_1, mapComp.w102_1];
+    lists = [mapComp[G.spriteTrees], mapComp[G.trees], mapComp[G.treesExtra]];
     for (i = 0; i < lists.length; i++) {
       try { arr = iterList(lists[i]); } catch (e) { arr = []; }
       for (j = 0; j < arr.length; j++) {
-        if (arr[j] && typeof arr[j].p3k === "function" && typeof arr[j].m3k === "function") out.push(arr[j]);
+        if (arr[j] && typeof arr[j][G.setVisible] === "function" && typeof arr[j][G.isVisible] === "function") out.push(arr[j]);
       }
     }
     return out;
   }
   function restoreTrees() {
     for (var i = 0; i < treesHidden.length; i++) {
-      try { treesHidden[i].o.p3k(treesHidden[i].was); } catch (e) {}
+      try { treesHidden[i].o[G.setVisible](treesHidden[i].was); } catch (e) {}
     }
     if (treesHidden.length) logDebug("parkour: trees restored (" + treesHidden.length + ")");
     treesHidden = [];
   }
+  var bushesHidden = readSetting("toCoords.parkourBushes", "1") === "1";
+  function setBushesHidden(hide) {
+    bushesHidden = hide;
+    writeSetting("toCoords.parkourBushes", hide ? "1" : "0");
+    applyParkourTrees();
+    flash(hide ? "кусты скрыты" : "кусты видны");
+  }
   function applyParkourTrees() {
-    if (OFF.trees || !isParkour() || !mapComp) {
+    if (OFF.trees || !isParkour() || !mapComp || !bushesHidden) {
       if (treesHidden.length) restoreTrees();
       return;
     }
@@ -2709,16 +2422,13 @@
       known = false;
       for (k = 0; k < treesHidden.length; k++) if (treesHidden[k].o === o) { known = true; break; }
       try {
-        if (!known) treesHidden.push({ o: o, was: !!o.m3k() });
-        if (o.m3k()) { o.p3k(false); n++; } // the game may switch them back on (quality change)
+        if (!known) treesHidden.push({ o: o, was: !!o[G.isVisible]() });
+        if (o[G.isVisible]()) { o[G.setVisible](false); n++; }
       } catch (e) {}
     }
     if (n) logDebug("parkour: trees hidden (" + n + ")");
   }
 
-  // Resumable search for the battle format, a few ms per frame, from the battle
-  // world, our tank's entity (via the camera) and the game root, until one of
-  // the three sources above turns up.
   var pkSearch = { q: null, seen: null, restarts: 0 };
   function parkourSearchDone() { return parkourKnown() && (!isParkour() || !!mapComp); }
   function parkourSearchStep(budgetMs) {
@@ -2734,12 +2444,12 @@
       pkSearch.restarts++;
       pkSearch.q = [];
       pkSearch.seen = new Set();
-      try { var bw = battleWorld(); if (bw && bw.syw_1) push(bw.syw_1.s2a_1); push(bw); } catch (e0) {}
+      try { var bw = battleWorld(); if (bw && bw[G.controllers]) push(bw[G.controllers][G.jsMap]); push(bw); } catch (e0) {}
       push(hooks.physicsWorld);
-      try { push(followCam && followCam.yz3_1); } catch (e1) {}
+      try { push(followCam && followCam[G.systemEntity]); } catch (e1) {}
       push(hooks.radarSystem);
       push(hooks.battleMap);
-      try { push(window.Launcher); } catch (e2) {}
+      try { push(window[GAME.globals.launcher]); } catch (e2) {}
     }
     while (pkSearch.q.length && n < 4000 && performance.now() - t0 < budgetMs) {
       obj = pkSearch.q.shift();
@@ -2761,12 +2471,6 @@
     }
   }
 
-  /* ---------- parkour camera (only in the parkour format) ----------
-   * Follow camera: spline tzs_1 (W3) with 4 keys wzu_1..zzu_1 { uzu_1: distance,
-   * vzu_1: height }, path position qzs_1, tzv(t) recomputes the offset (C3).
-   * The multiplier azv_1 is reset by the game (camera reset, free-camera
-   * controller), the keys never are: we scale the keys, so the camera moves
-   * back along the same line of sight. Shift + "+" / "-". */
   var followCam = null;
   var followCams = [];
   var camKeysOrig = typeof WeakMap === "function" ? new WeakMap() : null;
@@ -2774,46 +2478,45 @@
   try { var _pc = Number(localStorage.getItem("toCoords.parkourCam")); if (_pc >= 0.5 && _pc <= 8) parkourCam.mult = _pc; } catch (ePc) {}
   function camBody(cam) {
     try {
-      var tp = cam && cam.lzs_1;
-      var b = tp && (tp.mzq_1 || (typeof tp.fbk === "function" ? tp.fbk() : null));
-      return b && b.v9i_1 ? b : null;
+      var tp = cam && cam[G.cameraTankPhysics];
+      var b = tp && (tp[G.physicsBody] || (typeof tp[G.getBody] === "function" ? tp[G.getBody]() : null));
+      return b && b[G.bodyState] ? b : null;
     } catch (e) { return null; }
   }
   function rememberFollowCam(obj) {
     try {
-      if (obj && obj.tzs_1 && typeof obj.tzs_1.azv_1 === "number" && obj.tzs_1.wzu_1 && obj.tzs_1.zzu_1 &&
-          typeof obj.qzs_1 === "number" && typeof obj.tzv === "function") {
+      if (obj && obj[G.cameraSpline] && typeof obj[G.cameraSpline][G.splineScale] === "number" && obj[G.cameraSpline][G.splineKey0] && obj[G.cameraSpline][G.splineKey3] &&
+          typeof obj[G.cameraPath] === "number" && typeof obj[G.setCameraPath] === "function") {
         if (followCams.indexOf(obj) < 0) {
           followCams.push(obj);
           if (followCams.length > 4) followCams.shift();
           logDebug("follow camera found (" + followCams.length + ")");
         }
-        // the one that follows OUR tank
         if (followCam !== obj && (!followCam || !maybeOwnBody(camBody(followCam))) && maybeOwnBody(camBody(obj))) followCam = obj;
       }
     } catch (e) {}
   }
   function camKeys(cam) {
-    var sp = cam && cam.tzs_1;
-    return sp ? [sp.wzu_1, sp.xzu_1, sp.yzu_1, sp.zzu_1] : [];
+    var sp = cam && cam[G.cameraSpline];
+    return sp ? [sp[G.splineKey0], sp[G.splineKey1], sp[G.splineKey2], sp[G.splineKey3]] : [];
   }
   function setCamMult(cam, k) {
     try {
       var keys = camKeys(cam), i, orig;
       if (!keys.length || !keys[0]) return;
-      orig = camKeysOrig && camKeysOrig.get(cam.tzs_1);
+      orig = camKeysOrig && camKeysOrig.get(cam[G.cameraSpline]);
       if (!orig) {
-        if (k === 1) return; // never touched: nothing to restore
-        orig = keys.map(function (h) { return { u: h.uzu_1, v: h.vzu_1 }; });
-        if (camKeysOrig) camKeysOrig.set(cam.tzs_1, orig);
+        if (k === 1) return;
+        orig = keys.map(function (h) { return { u: h[G.keyDistance], v: h[G.keyHeight] }; });
+        if (camKeysOrig) camKeysOrig.set(cam[G.cameraSpline], orig);
       }
-      if (Math.abs(keys[0].uzu_1 - orig[0].u * k) < 1e-6 && Math.abs(keys[0].vzu_1 - orig[0].v * k) < 1e-6) return;
+      if (Math.abs(keys[0][G.keyDistance] - orig[0].u * k) < 1e-6 && Math.abs(keys[0][G.keyHeight] - orig[0].v * k) < 1e-6) return;
       for (i = 0; i < keys.length; i++) {
         if (!keys[i] || !orig[i]) continue;
-        keys[i].uzu_1 = orig[i].u * k;
-        keys[i].vzu_1 = orig[i].v * k;
+        keys[i][G.keyDistance] = orig[i].u * k;
+        keys[i][G.keyHeight] = orig[i].v * k;
       }
-      cam.tzv(cam.qzs_1); // same path position: only recomputes the offset
+      cam[G.setCameraPath](cam[G.cameraPath]);
     } catch (e) {}
   }
   function applyParkourCam() {
@@ -2825,7 +2528,7 @@
       }
       parkourCam.applied = true;
     } else if (parkourCam.applied) {
-      for (i = 0; i < followCams.length; i++) setCamMult(followCams[i], 1); // give the game its camera back
+      for (i = 0; i < followCams.length; i++) setCamMult(followCams[i], 1);
       parkourCam.applied = false;
     }
   }
@@ -2834,39 +2537,31 @@
     try { localStorage.setItem("toCoords.parkourCam", String(parkourCam.mult)); } catch (e) {}
     applyParkourCam();
     logDebug("parkour camera x" + parkourCam.mult);
-    minimap.flash = { text: "паркур: камера ×" + parkourCam.mult.toFixed(2), until: Date.now() + 1500 };
+    flash("паркур: камера ×" + parkourCam.mult.toFixed(2));
   }
 
-  // The battle world (has the controller Map syw_1.s2a_1), from whatever we hold.
   function battleWorld() {
     var c = [hooks.physicsWorld], i, w;
-    try { if (hooks.physicsBody && hooks.physicsBody.b9i_1) c.push(hooks.physicsBody.b9i_1.zz0_1); } catch (e) {}
-    try { if (hooks.radarSystem && hooks.radarSystem.yz3_1) c.push(hooks.radarSystem.yz3_1.zz0_1); } catch (e2) {}
+    try { if (hooks.physicsBody && hooks.physicsBody[G.bodyOwner]) c.push(hooks.physicsBody[G.bodyOwner][G.entityWorld]); } catch (e) {}
+    try { if (hooks.radarSystem && hooks.radarSystem[G.systemEntity]) c.push(hooks.radarSystem[G.systemEntity][G.entityWorld]); } catch (e2) {}
     for (i = 0; i < mountCandidates.length && i < 4; i++) {
-      try { c.push(mountCandidates[i].yz3_1 && mountCandidates[i].yz3_1.zz0_1); } catch (e3) {}
+      try { c.push(mountCandidates[i][G.systemEntity] && mountCandidates[i][G.systemEntity][G.entityWorld]); } catch (e3) {}
     }
     for (i = 0; i < c.length; i++) {
       w = c[i];
-      try { if (w && w.syw_1 && w.syw_1.s2a_1) return w; } catch (e4) {}
+      try { if (w && w[G.controllers] && w[G.controllers][G.jsMap]) return w; } catch (e4) {}
     }
     return null;
   }
   function walkBattleWorld(w, budgetMs) {
     if (!w) return;
     var seeds = [];
-    try { if (w.syw_1 && w.syw_1.s2a_1) seeds.push(w.syw_1.s2a_1); } catch (e) {}
+    try { if (w[G.controllers] && w[G.controllers][G.jsMap]) seeds.push(w[G.controllers][G.jsMap]); } catch (e) {}
     seeds.push(w);
     bfsScan(seeds, budgetMs, 3000, rememberLiveObjects);
   }
 
-  /* ---------- Magnum aim (own tank only: what the game draws while aiming) ----------
-   * Aim system: state k1ab_1 ("Stopped" / "Started" / "StartedIndicating"),
-   * trajectory points o1ab_1 (list, item.b14v_1 = position), count t1ab_1,
-   * landing hit s1ab_1 (j9q_1 = point), surface mark i1ab_1 (m3k() = shown),
-   * our tank body c1ab_1. It sits in the world's controller Map only while aiming.
-   * The game's own enemy-highlight (r1ab_1) is not read. */
   var magnumAim = null;
-  // false only when we can tell the body is somewhere else (> 8 m from us)
   function maybeOwnBody(b) {
     if (!b || b === hooks.physicsBody || !lastMeEngine) return true;
     var bp = bodyPos(b);
@@ -2875,9 +2570,9 @@
   }
   function rememberMagnumAim(obj) {
     try {
-      if (obj && obj.s1ab_1 && obj.s1ab_1.j9q_1 && typeof obj.t1ab_1 === "number" && obj.o1ab_1 && obj.k1ab_1 &&
-          obj.i1ab_1 && typeof obj.i1ab_1.m3k === "function" && typeof obj.m1ab_1 === "boolean") {
-        if (!maybeOwnBody(obj.c1ab_1)) return; // another tank's
+      if (obj && obj[G.aimHit] && obj[G.aimHit][G.hitPoint] && typeof obj[G.aimPointCount] === "number" && obj[G.aimPoints] && obj[G.aimState] &&
+          obj[G.aimMark] && typeof obj[G.aimMark][G.isVisible] === "function" && typeof obj[G.aimActive] === "boolean") {
+        if (!maybeOwnBody(obj[G.aimTankBody])) return;
         if (magnumAim !== obj) { magnumAim = obj; logDebug("magnum aim found"); }
       }
     } catch (e) {}
@@ -2886,51 +2581,20 @@
     var a = magnumAim;
     if (!a) return null;
     try {
-      if (!maybeOwnBody(a.c1ab_1)) { magnumAim = null; return null; }
-      if (enumStr(a.k1ab_1) !== "StartedIndicating") return null; // the game is not showing it
-      var pts = [], n = Math.min(a.t1ab_1 | 0, 1000), list = a.o1ab_1, i, it, v;
+      if (!maybeOwnBody(a[G.aimTankBody])) { magnumAim = null; return null; }
+      if (enumStr(a[G.aimState]) !== GAME.aimShowing) return null;
+      var pts = [], n = Math.min(a[G.aimPointCount] | 0, 1000), list = a[G.aimPoints], i, it, v;
       for (i = 0; i < n; i += 2) {
         it = null;
-        try { it = list.g1(i); } catch (eG) { break; }
-        v = it && vecToM(parseMapVec(it.b14v_1));
+        try { it = list[G.get](i); } catch (eG) { break; }
+        v = it && vecToM(parseMapVec(it[G.aimPointPosition]));
         if (v) pts.push(v);
       }
       var land = null;
-      try { if (a.i1ab_1.m3k()) land = vecToM(parseMapVec(a.s1ab_1.j9q_1)); } catch (eL) {}
+      try { if (a[G.aimMark][G.isVisible]()) land = vecToM(parseMapVec(a[G.aimHit][G.hitPoint])); } catch (eL) {}
       return { pts: pts, land: land };
     } catch (e) { return null; }
   }
-  function drawMagnumAim(ctx, toScreen) {
-    var st = magnumAimState();
-    if (!st) return;
-    var i, p;
-    ctx.save();
-    ctx.fillStyle = "#ffb000";
-    for (i = 0; i < st.pts.length; i++) {
-      p = toScreen(st.pts[i].x, st.pts[i].y);
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 1.6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    if (st.land) {
-      p = toScreen(st.land.x, st.land.y);
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = "rgba(0,0,0,0.8)";
-      ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "#ffb000";
-      ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(p.x - 12, p.y); ctx.lineTo(p.x - 4, p.y);
-      ctx.moveTo(p.x + 4, p.y); ctx.lineTo(p.x + 12, p.y);
-      ctx.moveTo(p.x, p.y - 12); ctx.lineTo(p.x, p.y - 4);
-      ctx.moveTo(p.x, p.y + 4); ctx.lineTo(p.x, p.y + 12);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  // Everything that lives in the battle world's controller Map.
   function rememberLiveObjects(obj) {
     rememberCpRuntime(obj);
     rememberFlagObj(obj);
@@ -2941,28 +2605,25 @@
     rememberMapComp(obj);
   }
 
-  // Our team name (TEAM_A / TEAM_B) from any live object that knows it.
   function localTeamName() {
     var i, t;
     for (i = 0; i < flagLive.length; i++) {
-      t = enumStr(flagLive[i].q13b_1 && flagLive[i].q13b_1.l10b_1);
-      if (t === "TEAM_A" || t === "TEAM_B") return t;
+      t = enumStr(flagLive[i][G.flagTeams] && flagLive[i][G.flagTeams][G.ourTeam]);
+      if (t === GAME.teams.a || t === GAME.teams.b) return t;
     }
     for (i = 0; i < cpLive.length; i++) {
-      t = enumStr(cpLive[i].x11f_1 && cpLive[i].x11f_1.l10b_1);
-      if (t === "TEAM_A" || t === "TEAM_B") return t;
+      t = enumStr(cpLive[i][G.cpTeams] && cpLive[i][G.cpTeams][G.ourTeam]);
+      if (t === GAME.teams.a || t === GAME.teams.b) return t;
     }
     return "";
   }
 
-  // Ours blue, theirs red (like the radar); spectators: TEAM_A red, TEAM_B blue.
   function cpTeamColor(team, local) {
-    if (team !== "TEAM_A" && team !== "TEAM_B") return "#8a8a8a";
-    if (local === "TEAM_A" || local === "TEAM_B") return team === local ? "#1e6bff" : "#ff2a2a";
-    return team === "TEAM_A" ? "#ff2a2a" : "#1e6bff";
+    if (team !== GAME.teams.a && team !== GAME.teams.b) return "#8a8a8a";
+    if (local === GAME.teams.a || local === GAME.teams.b) return team === local ? "#1e6bff" : "#ff2a2a";
+    return team === GAME.teams.a ? "#ff2a2a" : "#1e6bff";
   }
 
-  // Small breadth-first walk that also looks inside JS Map / Set values.
   function bfsScan(seeds, budgetMs, maxNodes, visit) {
     if (bfsScan.busy) return;
     bfsScan.busy = true;
@@ -2996,7 +2657,6 @@
   }
   var battle = { inBattle: false, id: 0, posGoneSince: 0, worldRef: null, mapName: null };
   var worldCandidates = [];
-  // Worlds we already switched away from. Never switch back to them, or two live worlds ping-pong forever.
   var retiredWorlds = typeof WeakSet === "function" ? new WeakSet() : null;
   var retiredWorldList = [];
   function isRetiredWorld(w) {
@@ -3018,61 +2678,7 @@
     strayedSince: 0, strayed: false, posNullSince: 0, posStale: false, bodiesWorld: null
   };
   var nativeState = { seq: 0, pending: {}, ready: null };
-  var minimap = {
-    on: true,
-    zoom: 2,
-    follow: true,
-    flipX: false,
-    flipY: false,
-    rotate: 0,
-    left: null,
-    top: 8,
-    right: 8,
-    wrap: null,
-    canvas: null,
-    statusEl: null,
-    offscreen: null,
-    bounds: null,
-    scale: 1,
-    builtFor: null,
-    dragging: false,
-    dragDx: 0,
-    dragDy: 0,
-    w: 300,
-    h: 300,
-    drive: false,
-    outlines: null,
-    driveCanvas: null,
-    driveMask: null,
-    resizing: false,
-    hover: false
-  };
-  var MINIMAP_PRESETS = { S: 240, M: 320, L: 440, XL: 640 };
-  var MINIMAP_MIN = 200;
-  var MINIMAP_MAX = 900;
 
-  function loadMinimapLayout() {
-    try {
-      var s = JSON.parse(localStorage.getItem("toCoords.minimap") || "null");
-      if (!s || typeof s !== "object") return;
-      if (isFiniteNum(s.w)) minimap.w = Math.max(MINIMAP_MIN, Math.min(MINIMAP_MAX, s.w));
-      if (isFiniteNum(s.h)) minimap.h = Math.max(MINIMAP_MIN, Math.min(MINIMAP_MAX, s.h));
-      if (isFiniteNum(s.left)) minimap.left = s.left;
-      if (isFiniteNum(s.top)) minimap.top = s.top;
-      if (isFiniteNum(s.zoom)) minimap.zoom = s.zoom;
-      // follow / drive have no buttons any more: zoomed in = follow the tank,
-      // x1 = whole map; drive mode only via toCoords.minimap({drive:true}).
-    } catch (e) {}
-  }
-  function saveMinimapLayout() {
-    try {
-      localStorage.setItem("toCoords.minimap", JSON.stringify({
-        w: minimap.w, h: minimap.h, left: minimap.left, top: minimap.top,
-        zoom: minimap.zoom, follow: minimap.follow, drive: !!minimap.drive
-      }));
-    } catch (e) {}
-  }
-  loadMinimapLayout();
 
   function rememberCapturedListener(fn) {
     if (typeof fn !== "function") return;
@@ -3108,7 +2714,7 @@
   }
 
   function isPosHooked() {
-    return !!(hooks.getLocalTankPosition || hooks.showPositionLocalTank || ownBodyFromCamera());
+    return !!(hooks.localTankPosition || hooks.printLocalTankPosition || ownBodyFromCamera());
   }
 
   function matFromEuler(e) {
@@ -3296,7 +2902,6 @@
     mapCache.id = mapFileId(stable);
     mapCache.source = source || stable.source || "file";
     mapCache.status = (stable.mapName || mapCache.id) + " · " + n;
-    minimap.builtFor = null;
     return true;
   }
 
@@ -3350,10 +2955,6 @@
 
   function mapFileName(id) {
     return "tanki-map-" + (id || "map") + ".json";
-  }
-
-  function mapPngName(id) {
-    return "tanki-map-" + (id || "map") + ".png";
   }
 
   function installNativeListener() {
@@ -3415,19 +3016,6 @@
     return nativeCall({ op: "write", name: mapFileName(id), text: JSON.stringify(data, null, 2) });
   }
 
-  function nativeReadPng(id) {
-    return nativeCall({ op: "readB64", name: mapPngName(id) }).then(function (res) {
-      if (!res || !res.ok || !res.b64) return null;
-      return "data:image/png;base64," + res.b64;
-    }).catch(function () { return null; });
-  }
-
-  function nativeWritePng(id, dataUrl) {
-    var m = String(dataUrl || "").match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
-    if (!m) return Promise.resolve({ ok: false, error: "bad png" });
-    return nativeCall({ op: "writeB64", name: mapPngName(id), b64: m[1] });
-  }
-
   function bundledUrl(name) {
     try {
       var base = document.documentElement.getAttribute("data-to-coords-maps");
@@ -3440,90 +3028,6 @@
     var url = bundledUrl(mapFileName(id));
     if (!url) return Promise.resolve(null);
     return fetch(url).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
-  }
-
-  function loadBundledPng(id) {
-    var url = bundledUrl(mapPngName(id));
-    if (!url) return Promise.resolve(null);
-    return fetch(url).then(function (r) { return r.ok ? r.blob() : null; }).then(function (blob) {
-      if (!blob) return null;
-      return new Promise(function (resolve) {
-        var reader = new FileReader();
-        reader.onload = function () { resolve(reader.result); };
-        reader.onerror = function () { resolve(null); };
-        reader.readAsDataURL(blob);
-      });
-    }).catch(function () { return null; });
-  }
-
-  function loadImageFromUrl(url) {
-    if (!url) return Promise.resolve(null);
-    return new Promise(function (resolve) {
-      var img = new Image();
-      img.onload = function () { resolve(img); };
-      img.onerror = function () { resolve(null); };
-      img.src = url;
-    });
-  }
-
-  // "Is this picture basically black?" — checked on a 64x64 thumbnail, so we never
-  // read back a multi-megapixel canvas (slow, and Chrome warns about it).
-  function canvasMostlyEmpty(src) {
-    if (!src || !src.width || !src.height) return true;
-    try {
-      var N = 64;
-      var c = document.createElement("canvas");
-      c.width = N;
-      c.height = N;
-      var g = c.getContext("2d", { willReadFrequently: true });
-      g.imageSmoothingEnabled = false; // point samples, like the old per-pixel check
-      g.drawImage(src, 0, 0, src.width, src.height, 0, 0, N, N);
-      var data = g.getImageData(0, 0, N, N).data;
-      var lit = 0, i;
-      for (i = 0; i < data.length; i += 4) {
-        if (data[i] + data[i + 1] + data[i + 2] > 90) lit++;
-      }
-      return (lit / (N * N)) < 0.05;
-    } catch (e) { return false; }
-  }
-
-  function imageMostlyEmpty(img) {
-    return canvasMostlyEmpty(img);
-  }
-
-  function attachMapTexture(id) {
-    if (!id) return Promise.resolve(null);
-    if (mapCache.texture && mapCache.textureId === id) return Promise.resolve(mapCache.texture);
-    function take(url) { return loadImageFromUrl(url); }
-    return nativeReadPng(id).then(function (url) {
-      if (url) return take(url);
-      return loadBundledPng(id).then(function (u2) { return u2 ? take(u2) : null; });
-    }).then(function (img) {
-      if (!img) return null;
-      if (imageMostlyEmpty(img)) {
-        logDebug("ignore empty cached png for " + id);
-        return null;
-      }
-      mapCache.texture = img;
-      mapCache.textureId = id;
-      return img;
-    }).catch(function () { return null; });
-  }
-
-  function maybeSaveOffscreenPng() {
-    if (!nativeState.ready || !minimap.offscreen || !mapCache.id) return;
-    if (canvasMostlyEmpty(minimap.offscreen)) {
-      logDebug("skip png save: offscreen empty");
-      return;
-    }
-    var id = mapCache.id;
-    nativeReadPng(id).then(function (existing) {
-      if (existing) return;
-      try {
-        var url = minimap.offscreen.toDataURL("image/png");
-        return nativeWritePng(id, url);
-      } catch (e) {}
-    }).catch(function () {});
   }
 
   function folderHasPermission(handle) {
@@ -3660,7 +3164,6 @@
       return (nativeState.ready === false ? Promise.resolve(null) : toNative()).then(function (nat) {
         if (nat && nat.ok) {
           idbPutMap(id, data).catch(function () {});
-          maybeSaveOffscreenPng();
           return nat;
         }
         return toIdb().then(toFolder);
@@ -3713,7 +3216,6 @@
 
   function ensureMapCached(forceExport) {
     if (mapCache.data && !forceExport) {
-      rebuildMinimapOffscreen();
       return Promise.resolve({ ok: true, id: mapCache.id, source: mapCache.source, cached: true });
     }
     mapCache.status = "ищу карту…";
@@ -3723,12 +3225,7 @@
       var nameId = (hooks.mapName && hooks.mapName !== "unknown") ? slugName(hooks.mapName) : null;
       return tryLoadById(nameId);
     }).then(function (found) {
-      if (found && applyMapData(found.data, found.source)) {
-        return attachMapTexture(mapCache.id).then(function () {
-          rebuildMinimapOffscreen();
-          return { ok: true, id: mapCache.id, source: found.source };
-        });
-      }
+      if (found && applyMapData(found.data, found.source)) return { ok: true, id: mapCache.id, source: found.source };
       var live = null;
       try { live = collectLiveMapData(); } catch (e) { live = null; }
       if (!live) {
@@ -3737,19 +3234,10 @@
       }
       var hashId = "h" + geometryHash(live);
       return tryLoadById(hashId).then(function (found2) {
-        if (found2 && applyMapData(found2.data, found2.source)) {
-          return attachMapTexture(mapCache.id).then(function () {
-            rebuildMinimapOffscreen();
-            return { ok: true, id: mapCache.id, source: found2.source };
-          });
-        }
+        if (found2 && applyMapData(found2.data, found2.source)) return { ok: true, id: mapCache.id, source: found2.source };
         applyMapData(live, "physicsWorld");
-        return attachMapTexture(mapCache.id).then(function () {
-          rebuildMinimapOffscreen();
-          return saveMap(false).then(function (res) {
-            maybeSaveOffscreenPng();
-            return { ok: true, id: mapCache.id, source: "exported", save: res };
-          });
+        return saveMap(false).then(function (res) {
+          return { ok: true, id: mapCache.id, source: "exported", save: res };
         });
       });
     }).catch(function (e) {
@@ -3768,1260 +3256,21 @@
         ensureMapCached(false).then(function (res) {
           mapCache.building = false;
           if (!res || !res.ok) mapCache.started = false;
-          updateMinimapChrome();
         }).catch(function () { mapCache.building = false; });
       } catch (e) { mapCache.building = false; }
     }, 0);
   }
 
-  function heightFill(z, zmin, zmax) {
-    var t = (z - zmin) / Math.max(0.001, zmax - zmin);
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    return "rgb(" + Math.round(92 + t * 118) + "," + Math.round(90 + t * 108) + "," + Math.round(74 + t * 82) + ")";
+  function sideOf(team, local) {
+    if (team !== GAME.teams.a && team !== GAME.teams.b) return "neutral";
+    if (local === GAME.teams.a || local === GAME.teams.b) return team === local ? "ally" : "enemy";
+    return team === GAME.teams.a ? "red" : "blue";
+  }
+  function legacySide(team) {
+    var t = normalizeTeam(team);
+    return t === "RED" ? "red" : (t === "BLUE" ? "blue" : "neutral");
   }
 
-  function mapWorldToOff(x, y, b) {
-    var rx = x, ry = y;
-    if (minimap.flipX) rx = b.xmin + b.xmax - rx;
-    if (minimap.flipY) ry = b.ymin + b.ymax - ry;
-    var cx = (b.xmin + b.xmax) / 2, cy = (b.ymin + b.ymax) / 2;
-    var rot = (minimap.rotate || 0) * Math.PI / 180;
-    if (rot) {
-      var dx = rx - cx, dy = ry - cy, c = Math.cos(rot), s = Math.sin(rot);
-      rx = cx + dx * c - dy * s;
-      ry = cy + dx * s + dy * c;
-    }
-    return { x: (rx - b.xmin) * b.scale, y: (b.ymax - ry) * b.scale };
-  }
-
-function triNormalZ(w) {
-    var ax = w[0].x, ay = w[0].y, az = w[0].z || 0;
-    var bx = w[1].x, by = w[1].y, bz = w[1].z || 0;
-    var cx = w[2].x, cy = w[2].y, cz = w[2].z || 0;
-    var nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-    var nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
-    var ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
-    var nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    return nz / nlen;
-  }
-
-  function planeCorners(pl) {
-    if (!pl || !pl.position) return null;
-    var hx = (pl.length || 0) / 2, hy = (pl.width || 0) / 2;
-    var e = pl.rotation || { x: 0, y: 0, z: 0 };
-    var i, sx, sy, v, signs = [[-1, -1], [1, -1], [1, 1], [-1, 1]], out = [];
-    var n = rotateEuler({ x: 0, y: 0, z: 1 }, e);
-    if (!n || Math.abs(n.z) < 0.45) return null;
-    for (i = 0; i < 4; i++) {
-      sx = signs[i][0];
-      sy = signs[i][1];
-      v = rotateEuler({ x: sx * hx, y: sy * hy, z: 0 }, e);
-      out.push({ x: pl.position.x + v.x, y: pl.position.y + v.y, z: pl.position.z + v.z });
-    }
-    return out;
-  }
-
-  function helperBoxName(name) {
-    if (!name || typeof name !== "string") return false;
-    return /grenade|aiming|foam|smoke/i.test(name);
-  }
-
-  function convexHullXY(points) {
-    var pts = [], i, j, seen = {};
-    for (i = 0; i < points.length; i++) {
-      if (!points[i] || !isFiniteNum(points[i].x)) continue;
-      j = Math.round(points[i].x * 100) + "," + Math.round(points[i].y * 100);
-      if (seen[j]) continue;
-      seen[j] = 1;
-      pts.push({ x: points[i].x, y: points[i].y });
-    }
-    pts.sort(function (a, b) { return a.x === b.x ? a.y - b.y : a.x - b.x; });
-    if (pts.length <= 2) return pts;
-    function cross(o, a, b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); }
-    var lower = [], upper = [];
-    for (i = 0; i < pts.length; i++) {
-      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], pts[i]) <= 0) lower.pop();
-      lower.push(pts[i]);
-    }
-    for (i = pts.length - 1; i >= 0; i--) {
-      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], pts[i]) <= 0) upper.pop();
-      upper.push(pts[i]);
-    }
-    lower.pop();
-    upper.pop();
-    return lower.concat(upper);
-  }
-
-  function boxZExtent(box) {
-    var cs = box && box.corners, zs, i, ze, z;
-    if (cs && cs.length >= 2) {
-      zs = [];
-      for (i = 0; i < cs.length; i++) zs.push(cs[i].z || 0);
-      return { ze: Math.max.apply(null, zs) - Math.min.apply(null, zs), z0: Math.min.apply(null, zs), z1: Math.max.apply(null, zs), zavg: zs.reduce(function (a, b) { return a + b; }, 0) / zs.length };
-    }
-    ze = Math.abs((box && box.size && box.size.z) || 0);
-    z = (box && box.position && box.position.z) || 0;
-    return { ze: ze, z0: z - ze / 2, z1: z + ze / 2, zavg: z };
-  }
-
-  function classifyMapBox(box) {
-    if (helperBoxName(box && box.name)) return "skip";
-    var sz = box && box.size;
-    if (!sz) return "skip";
-    var dims = [Math.abs(sz.x || 0), Math.abs(sz.y || 0), Math.abs(sz.z || 0)];
-    var maxd = Math.max(dims[0], dims[1], dims[2]);
-    var horiz = dims.slice().sort(function (a, b) { return a - b; });
-    var foot = horiz[1] * horiz[2];
-    var minHoriz = horiz[0];
-    // Don't drop a box only because it is short. Skip tiny debris only.
-    if (maxd < 0.4 && foot < 0.25) return "skip";
-    var ext = boxZExtent(box);
-    var ze = ext.ze;
-    // Thin floor plates stay slabs.
-    if (ze < 0.7 && horiz[2] >= 2) return "slab";
-    // Chunky tank-sized blocks (thickness ~ hull) are obstacles, even if not very tall.
-    if (minHoriz >= 1.5 && ze >= 0.7 && foot < 60) return "tall";
-    if (ze >= 1.5) return "tall";
-    if (ze < 1.2 && horiz[2] >= 2) return "slab";
-    if (ze < 2 && foot >= 16) return "slab";
-    if (ze <= 0.6) return "slab";
-    return "prop";
-  }
-
-  function polyAreaXY(pts) {
-    if (!pts || pts.length < 3) return 0;
-    var s = 0, i, a, b;
-    for (i = 0; i < pts.length; i++) {
-      a = pts[i];
-      b = pts[(i + 1) % pts.length];
-      s += a.x * b.y - b.x * a.y;
-    }
-    return Math.abs(s) / 2;
-  }
-
-  function projectWallLine(pts) {
-    if (!pts || pts.length < 2) return null;
-    var best = 0, a = pts[0], b = pts[pts.length - 1], i, j, d;
-    for (i = 0; i < pts.length; i++) {
-      for (j = i + 1; j < pts.length; j++) {
-        d = Math.hypot(pts[i].x - pts[j].x, pts[i].y - pts[j].y);
-        if (d > best) { best = d; a = pts[i]; b = pts[j]; }
-      }
-    }
-    if (best < 0.4) return null;
-    return { a: { x: a.x, y: a.y, z: a.z || 0 }, b: { x: b.x, y: b.y, z: b.z || 0 }, len: best };
-  }
-
-  function boxCornersOrMake(box) {
-    if (box.corners && box.corners.length >= 4) return box.corners;
-    if (!box.position || !box.size) return null;
-    var hx = Math.abs(box.size.x) / 2, hy = Math.abs(box.size.y) / 2, hz = Math.abs(box.size.z) / 2;
-    var rot = box.rotation || { x: 0, y: 0, z: 0 }, pos = box.position, out = [], sx, sy, sz, v;
-    for (sx = -1; sx <= 1; sx += 2)
-      for (sy = -1; sy <= 1; sy += 2)
-        for (sz = -1; sz <= 1; sz += 2) {
-          v = rotateEuler({ x: sx * hx, y: sy * hy, z: sz * hz }, rot);
-          out.push({ x: pos.x + v.x, y: pos.y + v.y, z: pos.z + v.z });
-        }
-    return out;
-  }
-
-  function planeCornersAny(pl) {
-    if (!pl || !pl.position) return null;
-    var hx = (pl.length || 0) / 2, hy = (pl.width || 0) / 2;
-    var e = pl.rotation || { x: 0, y: 0, z: 0 };
-    var n = rotateEuler({ x: 0, y: 0, z: 1 }, e);
-    var i, sx, sy, v, signs = [[-1, -1], [1, -1], [1, 1], [-1, 1]], out = [];
-    for (i = 0; i < 4; i++) {
-      sx = signs[i][0];
-      sy = signs[i][1];
-      v = rotateEuler({ x: sx * hx, y: sy * hy, z: 0 }, e);
-      out.push({ x: pl.position.x + v.x, y: pl.position.y + v.y, z: pl.position.z + v.z });
-    }
-    return { pts: out, nz: n ? Math.abs(n.z) : 1 };
-  }
-
-  function polyAvgZ(pts) {
-    var s = 0, i;
-    for (i = 0; i < pts.length; i++) s += pts[i].z || 0;
-    return s / pts.length;
-  }
-
-  function edgeKeyXY(a, b, step) {
-    step = step || 0.12;
-    function q(p) { return (Math.round(p.x / step)) + "," + (Math.round(p.y / step)); }
-    var ka = q(a), kb = q(b);
-    return ka < kb ? ka + "|" + kb : kb + "|" + ka;
-  }
-
-  function tightWorldBounds(surfaces, fallback) {
-    var pts = [], i, j, f, cs;
-    function add(p) {
-      if (p && isFiniteNum(p.x) && isFiniteNum(p.y)) pts.push(p);
-    }
-    if (surfaces) {
-      for (i = 0; i < (surfaces.floors || []).length; i++) {
-        f = surfaces.floors[i].pts || [];
-        for (j = 0; j < f.length; j++) add(f[j]);
-      }
-      for (i = 0; i < (surfaces.tall || []).length; i++) {
-        cs = surfaces.tall[i].corners || [];
-        for (j = 0; j < cs.length; j++) add(cs[j]);
-      }
-      for (i = 0; i < (surfaces.props || []).length; i++) {
-        cs = surfaces.props[i].corners || [];
-        for (j = 0; j < cs.length; j++) add(cs[j]);
-      }
-      for (i = 0; i < (surfaces.slopes || []).length; i++) {
-        f = surfaces.slopes[i].pts || [];
-        for (j = 0; j < f.length; j++) add(f[j]);
-      }
-      for (i = 0; i < (surfaces.walls || []).length; i++) {
-        add(surfaces.walls[i].a);
-        add(surfaces.walls[i].b);
-      }
-    }
-    if (pts.length < 3) return fallback || null;
-    var xs = pts.map(function (p) { return p.x; }).sort(function (a, b) { return a - b; });
-    var ys = pts.map(function (p) { return p.y; }).sort(function (a, b) { return a - b; });
-    var zs = pts.map(function (p) { return p.z || 0; }).sort(function (a, b) { return a - b; });
-    var mx = xs[xs.length >> 1], my = ys[ys.length >> 1];
-    var keep = pts.filter(function (p) { return Math.hypot(p.x - mx, p.y - my) < 400; });
-    if (keep.length >= 3) {
-      xs = keep.map(function (p) { return p.x; }).sort(function (a, b) { return a - b; });
-      ys = keep.map(function (p) { return p.y; }).sort(function (a, b) { return a - b; });
-      zs = keep.map(function (p) { return p.z || 0; }).sort(function (a, b) { return a - b; });
-    }
-    return {
-      min: { x: xs[0], y: ys[0], z: zs[0] },
-      max: { x: xs[xs.length - 1], y: ys[ys.length - 1], z: zs[zs.length - 1] }
-    };
-  }
-
-  function collectMinimapSurfaces(data) {
-    var floors = [], slopes = [], walls = [], tall = [], props = [];
-    var stats = {
-      boxes: 0, planes: 0, tris: 0,
-      floors: 0, slopes: 0, walls: 0, tall: 0, props: 0, slabs: 0, skipped: 0,
-      planeFloor: 0, planeSlope: 0, planeWall: 0,
-      triFloor: 0, triSlope: 0, triWall: 0
-    };
-    function addWall(pts) {
-      var line = projectWallLine(pts);
-      if (line) walls.push(line);
-    }
-    function addPoly(pts, nz) {
-      if (!pts || pts.length < 2) return;
-      if (nz >= COS35) {
-        floors.push({ pts: pts, z: polyAvgZ(pts), nz: nz });
-        return "floor";
-      }
-      addWall(pts);
-      if (nz >= 0.08 && polyAreaXY(pts) >= 0.4) {
-        slopes.push({ pts: pts, z: polyAvgZ(pts), nz: nz });
-        return "slope";
-      }
-      return "wall";
-    }
-    var geom = data && data.collision;
-    if (!geom) return { floors: floors, slopes: slopes, walls: walls, tall: tall, props: props, stats: stats };
-    var i, t, w, nz, box, kind, cs, rec, pc, ext, cls;
-    var tris = geom.triangles || [];
-    stats.tris = tris.length;
-    for (i = 0; i < tris.length; i++) {
-      t = tris[i];
-      w = t.world || [t.v0, t.v1, t.v2];
-      if (!w || !w[0] || !w[1] || !w[2]) continue;
-      nz = Math.abs(triNormalZ(w));
-      cls = addPoly(w, nz);
-      if (cls === "floor") stats.triFloor++;
-      else if (cls === "slope") stats.triSlope++;
-      else if (cls === "wall") stats.triWall++;
-    }
-    var planes = geom.planes || [];
-    stats.planes = planes.length;
-    for (i = 0; i < planes.length; i++) {
-      pc = planeCornersAny(planes[i]);
-      if (!pc) continue;
-      cls = addPoly(pc.pts, pc.nz);
-      if (cls === "floor") stats.planeFloor++;
-      else if (cls === "slope") stats.planeSlope++;
-      else if (cls === "wall") stats.planeWall++;
-    }
-    var boxes = geom.boxes || [];
-    stats.boxes = boxes.length;
-    for (i = 0; i < boxes.length; i++) {
-      box = boxes[i];
-      kind = classifyMapBox(box);
-      cs = boxCornersOrMake(box);
-      if (!cs || kind === "skip") { stats.skipped++; continue; }
-      ext = boxZExtent(box);
-      rec = { corners: cs, ext: ext };
-      if (kind === "tall") tall.push(rec);
-      else if (kind === "prop") props.push(rec);
-      else if (kind === "slab") {
-        floors.push({ pts: convexHullXY(cs), z: ext.zavg, nz: 1 });
-        stats.slabs++;
-      }
-    }
-    stats.floors = floors.length;
-    stats.slopes = slopes.length;
-    stats.walls = walls.length;
-    stats.tall = tall.length;
-    stats.props = props.length;
-    return { floors: floors, slopes: slopes, walls: walls, tall: tall, props: props, stats: stats };
-  }
-
-  function silhouetteEdges(floors, zfloor) {
-    var acc = {}, i, f, n, a, b, k, items, zs, nzs, j, ln;
-    for (i = 0; i < floors.length; i++) {
-      f = floors[i];
-      n = f.pts.length;
-      for (j = 0; j < n; j++) {
-        a = f.pts[j];
-        b = f.pts[(j + 1) % n];
-        k = edgeKeyXY(a, b);
-        if (!acc[k]) acc[k] = [];
-        acc[k].push({ z: f.z, a: a, b: b, nz: f.nz });
-      }
-    }
-    var out = [];
-    for (k in acc) {
-      if (!acc.hasOwnProperty(k)) continue;
-      items = acc[k];
-      zs = []; nzs = [];
-      for (i = 0; i < items.length; i++) { zs.push(items[i].z); nzs.push(items[i].nz); }
-      a = items[0].a; b = items[0].b;
-      ln = Math.hypot(a.x - b.x, a.y - b.y);
-      if (items.length >= 2) {
-        if (Math.max.apply(null, zs) - Math.min.apply(null, zs) >= 1.5 && Math.min.apply(null, nzs) >= 0.85 && ln >= 1.2) {
-          out.push({ a: a, b: b, kind: "drop" });
-        }
-      } else if (items[0].z >= zfloor + 2 && items[0].nz >= 0.9 && ln >= 1.2) {
-        out.push({ a: a, b: b, kind: "rim" });
-      }
-    }
-    return out;
-  }
-
-  function buildDriveMask(data, surfaces) {
-    var bounds = data.bounds || collectBounds(data);
-    if (!bounds || !bounds.min) return null;
-    var pad = 4;
-    var minx = bounds.min.x - pad, miny = bounds.min.y - pad;
-    var maxx = bounds.max.x + pad, maxy = bounds.max.y + pad;
-    var cell = 1;
-    var w = Math.ceil((maxx - minx) / cell), h = Math.ceil((maxy - miny) / cell);
-    if (w * h > 800 * 800) {
-      cell = Math.max((maxx - minx) / 800, (maxy - miny) / 800);
-      w = Math.ceil((maxx - minx) / cell);
-      h = Math.ceil((maxy - miny) / cell);
-    }
-    var n = w * h;
-    var height = new Float32Array(n);
-    var kind = new Uint8Array(n);
-    var blocked = new Uint8Array(n);
-    var i;
-    for (i = 0; i < n; i++) height[i] = NaN;
-
-    function at(ix, iy) { return iy * w + ix; }
-
-    function fillTri(a, b, c, asWall) {
-      var nx = triNormalZ([a, b, c]);
-      var nz = Math.abs(nx);
-      var minTX = Math.min(a.x, b.x, c.x), maxTX = Math.max(a.x, b.x, c.x);
-      var minTY = Math.min(a.y, b.y, c.y), maxTY = Math.max(a.y, b.y, c.y);
-      var x0 = Math.floor((minTX - minx) / cell), x1 = Math.ceil((maxTX - minx) / cell);
-      var y0 = Math.floor((minTY - miny) / cell), y1 = Math.ceil((maxTY - miny) / cell);
-      var area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-      if (Math.abs(area) < 1e-9) return;
-      var ix, iy, px, py, w0, w1, w2, z, id, isWall;
-      isWall = asWall || nz < COS35;
-      for (iy = y0; iy <= y1; iy++) {
-        for (ix = x0; ix <= x1; ix++) {
-          if (ix < 0 || iy < 0 || ix >= w || iy >= h) continue;
-          px = minx + (ix + 0.5) * cell;
-          py = miny + (iy + 0.5) * cell;
-          w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area;
-          w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area;
-          w2 = 1 - w0 - w1;
-          if (w0 < -0.01 || w1 < -0.01 || w2 < -0.01) continue;
-          z = w0 * a.z + w1 * b.z + w2 * c.z;
-          id = at(ix, iy);
-          if (isWall) {
-            blocked[id] = 1;
-            kind[id] = 3;
-          } else if (kind[id] !== 3) {
-            kind[id] = nz < 0.97 ? 2 : 1;
-          }
-          if (!isFinite(height[id]) || z > height[id]) height[id] = z;
-        }
-      }
-    }
-
-    function fillPoly(pts, asWall) {
-      var j;
-      if (!pts || pts.length < 3) return;
-      for (j = 1; j < pts.length - 1; j++) fillTri(pts[0], pts[j], pts[j + 1], asWall);
-    }
-
-    var floors = surfaces.floors, tall = surfaces.tall, slopes = surfaces.slopes || [];
-    for (i = 0; i < floors.length; i++) fillPoly(floors[i].pts, false);
-    for (i = 0; i < slopes.length; i++) fillPoly(slopes[i].pts, true);
-    for (i = 0; i < tall.length; i++) {
-      if (tall[i].ext.ze < 0.5) continue;
-      fillPoly(convexHullXY(tall[i].corners), true);
-    }
-
-    var rad = Math.ceil((TANK_WIDTH_M / 2) / cell);
-    var blocked2 = new Uint8Array(n);
-    blocked2.set(blocked);
-    var ix, iy, dx, dy, jx, jy;
-    for (iy = 0; iy < h; iy++) {
-      for (ix = 0; ix < w; ix++) {
-        if (!blocked[at(ix, iy)]) continue;
-        for (dy = -rad; dy <= rad; dy++) {
-          for (dx = -rad; dx <= rad; dx++) {
-            if (dx * dx + dy * dy > rad * rad + 0.25) continue;
-            jx = ix + dx; jy = iy + dy;
-            if (jx >= 0 && jy >= 0 && jx < w && jy < h) blocked2[at(jx, jy)] = 1;
-          }
-        }
-      }
-    }
-
-    var walk = new Uint8Array(n);
-    for (i = 0; i < n; i++) {
-      if ((kind[i] === 1 || kind[i] === 2) && !blocked2[i] && isFinite(height[i])) walk[i] = 1;
-    }
-
-    var ramps = [], z, zz, zmin, zmax, ox, oy;
-    for (iy = 0; iy < h; iy++) {
-      for (ix = 0; ix < w; ix++) {
-        i = at(ix, iy);
-        if (!walk[i] || kind[i] !== 2) continue;
-        z = height[i];
-        [[1, 0], [0, 1], [-1, 0], [0, -1]].forEach(function (d) {
-          jx = ix + d[0]; jy = iy + d[1];
-          if (jx < 0 || jy < 0 || jx >= w || jy >= h) return;
-          if (!walk[at(jx, jy)]) return;
-          zz = height[at(jx, jy)] - z;
-          if (zz < 0.45 || zz > 0.7) return;
-          zmin = z; zmax = z;
-          for (oy = -2; oy <= 2; oy++) {
-            for (ox = -2; ox <= 2; ox++) {
-              if (ix + ox < 0 || iy + oy < 0 || ix + ox >= w || iy + oy >= h) continue;
-              if (!walk[at(ix + ox, iy + oy)]) continue;
-              zz = height[at(ix + ox, iy + oy)];
-              if (zz < zmin) zmin = zz;
-              if (zz > zmax) zmax = zz;
-            }
-          }
-          if (zmax - zmin >= 2.0) ramps.push({ ix: ix, iy: iy, dx: d[0], dy: d[1] });
-        });
-      }
-    }
-
-    return { w: w, h: h, cell: cell, minx: minx, miny: miny, walk: walk, blocked: blocked2, height: height, kind: kind, ramps: ramps, id: mapCache.id };
-  }
-
-  function paintDriveCanvas(mask, bmap, w, h) {
-    var cnv = document.createElement("canvas");
-    cnv.width = w;
-    cnv.height = h;
-    var ctx = cnv.getContext("2d");
-    ctx.clearRect(0, 0, w, h);
-    if (!mask) return cnv;
-    var cell = mask.cell, ix, iy, i, x0, y0, p0, p1, x2, y2;
-    function toOff(x, y) { return mapWorldToOff(x, y, bmap); }
-    for (iy = 0; iy < mask.h; iy++) {
-      for (ix = 0; ix < mask.w; ix++) {
-        i = iy * mask.w + ix;
-        x0 = mask.minx + ix * cell;
-        y0 = mask.miny + iy * cell;
-        p0 = toOff(x0, y0 + cell);
-        p1 = toOff(x0 + cell, y0);
-        if (mask.walk[i]) ctx.fillStyle = "rgb(210,208,196)";
-        else ctx.fillStyle = ((ix + iy) % 3 === 0) ? "rgb(40,40,38)" : "rgb(32,32,30)";
-        ctx.fillRect(Math.min(p0.x, p1.x), Math.min(p0.y, p1.y), Math.max(1, Math.abs(p1.x - p0.x)), Math.max(1, Math.abs(p1.y - p0.y)));
-      }
-    }
-    ctx.strokeStyle = "rgb(40,90,200)";
-    ctx.lineWidth = 2.5;
-    ctx.lineCap = "round";
-    for (i = 0; i < mask.ramps.length; i++) {
-      ix = mask.ramps[i].ix; iy = mask.ramps[i].iy;
-      x0 = mask.minx + (ix + 0.5) * cell;
-      y0 = mask.miny + (iy + 0.5) * cell;
-      x2 = x0 + mask.ramps[i].dx * cell * 0.85;
-      y2 = y0 + mask.ramps[i].dy * cell * 0.85;
-      p0 = toOff(x0, y0); p1 = toOff(x2, y2);
-      ctx.beginPath();
-      ctx.moveTo(p0.x, p0.y);
-      ctx.lineTo(p1.x, p1.y);
-      ctx.stroke();
-    }
-    return cnv;
-  }
-
-  function rebuildMinimapOffscreen() {
-    var data = mapCache.data;
-    if (!data || !data.collision) return false;
-    var bounds = data.bounds || collectBounds(data);
-    if (!bounds || !bounds.min) return false;
-    var surfaces = collectMinimapSurfaces(data);
-    var floors = surfaces.floors, tall = surfaces.tall, props = surfaces.props;
-    var slopes = surfaces.slopes || [], walls = surfaces.walls || [], surfStats = surfaces.stats || {};
-    var tight = tightWorldBounds(surfaces, bounds);
-    if (tight && tight.min) bounds = tight;
-    var zs = [], i, f;
-    for (i = 0; i < floors.length; i++) zs.push(floors[i].z);
-    zs.sort(function (a, b) { return a - b; });
-    var zmin = zs.length > 10 ? zs[Math.floor(zs.length * 0.02)] : (zs[0] || 0);
-    var zmax = zs.length > 10 ? zs[Math.floor(zs.length * 0.92)] : (zs[zs.length - 1] || 8);
-    if (zmax - zmin < 1) zmax = zmin + 4;
-    var zfloor = zs.length > 10 ? zs[Math.floor(zs.length * 0.15)] : zmin;
-    var pad = 5;
-    var xmin = bounds.min.x - pad, xmax = bounds.max.x + pad;
-    var ymin = bounds.min.y - pad, ymax = bounds.max.y + pad;
-    var spanX = Math.max(1, xmax - xmin), spanY = Math.max(1, ymax - ymin);
-    var long = Math.max(spanX, spanY);
-    var px = 1400;
-    var scale = px / long;
-    var w = Math.max(32, Math.round(spanX * scale));
-    var h = Math.max(32, Math.round(spanY * scale));
-    var bmap = { xmin: xmin, xmax: xmax, ymin: ymin, ymax: ymax, scale: scale };
-    var fillC = document.createElement("canvas");
-    fillC.width = w; fillC.height = h;
-    var ctx = fillC.getContext("2d");
-    ctx.fillStyle = "#121210";
-    ctx.fillRect(0, 0, w, h);
-    floors.sort(function (a, b) { return a.z - b.z; });
-    var k, p0, p1, pts;
-    for (i = 0; i < floors.length; i++) {
-      f = floors[i];
-      if (!f.pts || f.pts.length < 3) continue;
-      ctx.beginPath();
-      p0 = mapWorldToOff(f.pts[0].x, f.pts[0].y, bmap);
-      ctx.moveTo(p0.x, p0.y);
-      for (k = 1; k < f.pts.length; k++) {
-        p1 = mapWorldToOff(f.pts[k].x, f.pts[k].y, bmap);
-        ctx.lineTo(p1.x, p1.y);
-      }
-      ctx.closePath();
-      ctx.fillStyle = heightFill(f.z, zmin, zmax);
-      ctx.fill();
-    }
-    for (i = 0; i < props.length; i++) {
-      pts = convexHullXY(props[i].corners);
-      if (pts.length < 3) continue;
-      ctx.beginPath();
-      p0 = mapWorldToOff(pts[0].x, pts[0].y, bmap);
-      ctx.moveTo(p0.x, p0.y);
-      for (k = 1; k < pts.length; k++) {
-        p1 = mapWorldToOff(pts[k].x, pts[k].y, bmap);
-        ctx.lineTo(p1.x, p1.y);
-      }
-      ctx.closePath();
-      ctx.fillStyle = "rgba(168,168,160,0.8)";
-      ctx.fill();
-    }
-    function paintHatchPoly(target, pts, fill, hatch) {
-      if (!pts || pts.length < 3) return;
-      var k, p0, p1, minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity, xx, yy;
-      target.beginPath();
-      p0 = mapWorldToOff(pts[0].x, pts[0].y, bmap);
-      target.moveTo(p0.x, p0.y);
-      minx = maxx = p0.x; miny = maxy = p0.y;
-      for (k = 1; k < pts.length; k++) {
-        p1 = mapWorldToOff(pts[k].x, pts[k].y, bmap);
-        target.lineTo(p1.x, p1.y);
-        if (p1.x < minx) minx = p1.x; if (p1.x > maxx) maxx = p1.x;
-        if (p1.y < miny) miny = p1.y; if (p1.y > maxy) maxy = p1.y;
-      }
-      target.closePath();
-      target.fillStyle = fill;
-      target.fill();
-      target.save();
-      target.clip();
-      target.strokeStyle = hatch;
-      target.lineWidth = 1.6;
-      var x, span = (maxx - minx) + (maxy - miny) + 8;
-      for (x = minx - (maxy - miny); x < maxx + span; x += 7) {
-        target.beginPath();
-        target.moveTo(x, miny);
-        target.lineTo(x + (maxy - miny), maxy);
-        target.stroke();
-      }
-      target.restore();
-      target.strokeStyle = "rgba(210,80,20,0.95)";
-      target.lineWidth = 1.8;
-      target.stroke();
-    }
-    for (i = 0; i < slopes.length; i++) paintHatchPoly(ctx, slopes[i].pts, "rgba(220,110,30,0.42)", "rgba(255,170,70,0.9)");
-
-    var outC = document.createElement("canvas");
-    outC.width = w; outC.height = h;
-    var octx = outC.getContext("2d");
-    octx.strokeStyle = "#000000";
-    octx.lineWidth = 2.75;
-    octx.lineJoin = "round";
-    octx.lineCap = "round";
-    var edges = silhouetteEdges(floors, zfloor), e;
-    function strokeSeg(a, b) {
-      var qa = mapWorldToOff(a.x, a.y, bmap), qb = mapWorldToOff(b.x, b.y, bmap);
-      octx.beginPath();
-      octx.moveTo(qa.x, qa.y);
-      octx.lineTo(qb.x, qb.y);
-      octx.stroke();
-    }
-    for (i = 0; i < edges.length; i++) strokeSeg(edges[i].a, edges[i].b);
-    for (i = 0; i < tall.length; i++) {
-      pts = convexHullXY(tall[i].corners);
-      if (pts.length < 3) continue;
-      octx.beginPath();
-      p0 = mapWorldToOff(pts[0].x, pts[0].y, bmap);
-      octx.moveTo(p0.x, p0.y);
-      for (k = 1; k < pts.length; k++) {
-        p1 = mapWorldToOff(pts[k].x, pts[k].y, bmap);
-        octx.lineTo(p1.x, p1.y);
-      }
-      octx.closePath();
-      octx.fillStyle = "rgba(0,0,0,0.55)";
-      octx.fill();
-      octx.stroke();
-    }
-    octx.strokeStyle = "#000000";
-    octx.lineWidth = 3.4;
-    octx.lineCap = "round";
-    for (i = 0; i < walls.length; i++) strokeSeg(walls[i].a, walls[i].b);
-    // steep slope outlines already hatched on fill; also mark their long edges
-    for (i = 0; i < slopes.length; i++) {
-      var sl = projectWallLine(slopes[i].pts);
-      if (sl) strokeSeg(sl.a, sl.b);
-    }
-
-    var splitZ = 2.4;
-    var raised = [];
-    for (i = 0; i < floors.length; i++) if (floors[i].z > 0.8) raised.push(floors[i].z);
-    raised.sort(function (a, b) { return a - b; });
-    if (raised.length) {
-      splitZ = raised[Math.min(raised.length - 1, Math.floor(raised.length * 0.55))];
-      if (splitZ < 1.6) splitZ = 1.6;
-    }
-    var lowC = document.createElement("canvas");
-    var highC = document.createElement("canvas");
-    lowC.width = w; lowC.height = h;
-    highC.width = w; highC.height = h;
-    var lctx = lowC.getContext("2d");
-    var hctx = highC.getContext("2d");
-    function paintLayer(target, pred, dashed) {
-      var j, item, q0, q1, kk;
-      for (j = 0; j < floors.length; j++) {
-        item = floors[j];
-        if (!pred(item.z) || item.pts.length < 3) continue;
-        target.beginPath();
-        q0 = mapWorldToOff(item.pts[0].x, item.pts[0].y, bmap);
-        target.moveTo(q0.x, q0.y);
-        for (kk = 1; kk < item.pts.length; kk++) {
-          q1 = mapWorldToOff(item.pts[kk].x, item.pts[kk].y, bmap);
-          target.lineTo(q1.x, q1.y);
-        }
-        target.closePath();
-        target.fillStyle = heightFill(item.z, zmin, zmax);
-        target.globalAlpha = dashed ? 0.55 : 1;
-        target.fill();
-        if (dashed) {
-          target.setLineDash([6, 5]);
-          target.strokeStyle = "rgba(230,220,180,0.85)";
-          target.lineWidth = 2;
-          target.stroke();
-          target.setLineDash([]);
-        }
-        target.globalAlpha = 1;
-      }
-    }
-    paintLayer(lctx, function (z) { return z < splitZ; }, false);
-    paintLayer(hctx, function (z) { return z >= splitZ; }, true);
-
-    var mask = null;
-    try { mask = buildDriveMask(data, surfaces); } catch (eD) { mask = null; logDebug("drive mask error: " + (eD && eD.message || eD)); }
-    var driveC = null;
-    try { driveC = paintDriveCanvas(mask, bmap, w, h); } catch (eD2) { driveC = null; }
-
-    minimap.offscreen = fillC;
-    minimap.outlines = outC;
-    minimap.driveCanvas = driveC;
-    minimap.driveMask = mask;
-    mapCache.driveMask = mask;
-    minimap.layerLow = lowC;
-    minimap.layerHigh = highC;
-    minimap.splitZ = splitZ;
-    minimap.bounds = bmap;
-    minimap.scale = scale;
-    minimap.builtFor = mapCache.id;
-    logDebug("minimap built id=" + mapCache.id +
-      " floors=" + floors.length +
-      " slopes=" + slopes.length +
-      " walls=" + walls.length +
-      " tall=" + tall.length +
-      " props=" + props.length +
-      " slabs=" + (surfStats.slabs || 0) +
-      " skip=" + (surfStats.skipped || 0) +
-      " planes=" + (surfStats.planeFloor || 0) + "/" + (surfStats.planeSlope || 0) + "/" + (surfStats.planeWall || 0) +
-      " tris=" + (surfStats.triFloor || 0) + "/" + (surfStats.triSlope || 0) + "/" + (surfStats.triWall || 0) +
-      " edges=" + edges.length + (mask ? " drive=" + mask.w + "x" + mask.h : ""));
-    minimap.lastSurfStats = surfStats;
-    return true;
-  }
-
-
-  function niceMetres(span) {
-    var steps = [5, 10, 20, 25, 50, 100, 200, 250, 500];
-    var i, target = span * 0.28;
-    for (i = 0; i < steps.length; i++) if (steps[i] >= target) return steps[i];
-    return 1000;
-  }
-
-  function updateMinimapChrome() {
-    if (!minimap.wrap) return;
-    function setText(el, t) { if (el && el.textContent !== t) el.textContent = t; }
-    var st = minimap.statusEl;
-    if (st && minimap.flash && Date.now() < minimap.flash.until) {
-      setText(st, minimap.flash.text);
-    } else if (st) {
-      if (nativeState.ready) setText(st, mapCache.status || "maps: tanki-ext/maps");
-      else if (mapCache.needFolderClick) setText(st, "в консоли toCoords.pickMapFolder() или поставь native-host");
-      else setText(st, mapCache.status || "");
-    }
-  }
-
-  function clampMinimapDim(v) {
-    return Math.max(MINIMAP_MIN, Math.min(MINIMAP_MAX, Math.round(v)));
-  }
-
-  function bumpMinimapSize(factor) {
-    minimap.w = clampMinimapDim((minimap.w || MINIMAP_SIZE) * factor);
-    minimap.h = clampMinimapDim((minimap.h || MINIMAP_SIZE) * factor);
-    applyMinimapSize();
-    saveMinimapLayout();
-    try { drawMinimap(); } catch (e) {}
-  }
-
-  function applyMinimapPreset(name) {
-    var s = MINIMAP_PRESETS[name];
-    if (!s) return;
-    minimap.w = s;
-    minimap.h = s;
-    applyMinimapSize();
-    saveMinimapLayout();
-    try { drawMinimap(); } catch (e) {}
-  }
-
-  function applyMinimapSize() {
-    var wrap = minimap.wrap || document.getElementById(MINIMAP_ID);
-    var cnv = minimap.canvas;
-    var w = clampMinimapDim(minimap.w || MINIMAP_SIZE);
-    var h = clampMinimapDim(minimap.h || MINIMAP_SIZE);
-    minimap.w = w;
-    minimap.h = h;
-    var sizeKey = w + "x" + h;
-    if (wrap && cnv && wrap._toCoordsSize === sizeKey && cnv.width === w && cnv.height === h) return;
-    if (wrap) wrap._toCoordsSize = sizeKey;
-    if (wrap) {
-      wrap.style.width = w + "px";
-      wrap.style.height = "auto"; // bar + canvas + status, whatever their height
-    }
-    if (cnv) {
-      if (cnv.width !== w) cnv.width = w;
-      if (cnv.height !== h) cnv.height = h;
-      cnv.style.width = "100%";
-      cnv.style.height = h + "px";
-    }
-  }
-
-  function ensureMinimap() {
-    if (minimap.wrap && minimap.wrap.isConnected && minimap.canvas && minimap.wrap._toCoordsOk) return minimap.wrap;
-    var wrap = document.getElementById(MINIMAP_ID);
-    if (wrap && (wrap.dataset.v !== "3" || !wrap.querySelector("[data-act=zoomIn]") || !wrap.querySelector("[data-resize=w]"))) {
-      if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
-      wrap = null;
-      minimap.wrap = null;
-    }
-    if (wrap) {
-      minimap.wrap = wrap;
-      minimap.canvas = wrap.querySelector("canvas");
-      minimap.statusEl = wrap.querySelector("[data-role=status]");
-      applyMinimapSize();
-      wrap._toCoordsOk = true;
-      return wrap;
-    }
-    wrap = document.createElement("div");
-    wrap.id = MINIMAP_ID;
-    wrap.dataset.v = "3";
-    wrap.style.cssText = [
-      "position:fixed",
-      "top:" + (minimap.top != null ? minimap.top : 8) + "px",
-      minimap.left != null ? ("left:" + minimap.left + "px") : "right:8px",
-      minimap.left != null ? "right:auto" : "left:auto",
-      "z-index:2147483647", "width:" + (minimap.w || MINIMAP_SIZE) + "px",
-      "background:rgba(0,0,0,0.72)", "border-radius:4px",
-      "box-shadow:0 2px 8px rgba(0,0,0,0.45)", "color:#d6ffd6",
-      "font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
-      "user-select:none", "overflow:visible", "touch-action:none",
-      "min-width:" + MINIMAP_MIN + "px", "pointer-events:auto"
-    ].join(";");
-    var bar = document.createElement("div");
-    bar.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 6px;cursor:move;background:rgba(255,255,255,0.04);pointer-events:auto";
-    var title = document.createElement("span");
-    title.textContent = "карта";
-    title.style.flex = "1";
-    function mkBtn(label, act) {
-      var b = document.createElement("button");
-      b.type = "button";
-      b.dataset.act = act;
-      b.textContent = label;
-      b.style.cssText = "background:#1a6885;color:#fff;border:0;border-radius:3px;padding:2px 6px;cursor:pointer;font:11px sans-serif";
-      return b;
-    }
-    var btnZoomOut = mkBtn("−", "zoomOut");
-    var btnZoomIn = mkBtn("+", "zoomIn");
-    btnZoomOut.title = "отдалить (колесо мыши)";
-    btnZoomIn.title = "приблизить (колесо мыши)";
-    bar.appendChild(title);
-    bar.appendChild(btnZoomOut);
-    bar.appendChild(btnZoomIn);
-    var cnv = document.createElement("canvas");
-    cnv.width = minimap.w || MINIMAP_SIZE;
-    cnv.height = minimap.h || MINIMAP_SIZE;
-    cnv.style.cssText = "display:block;width:100%;height:" + (minimap.h || MINIMAP_SIZE) + "px;background:#141412";
-    var status = document.createElement("div");
-    status.dataset.role = "status";
-    status.style.cssText = "padding:2px 6px 4px;color:#9aaa9a;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
-    var EDGE = 6, CORNER = 14;
-    var handleDefs = {
-      n:  ["top:-3px", "left:" + CORNER + "px", "right:" + CORNER + "px", "height:" + EDGE + "px", "cursor:ns-resize"],
-      s:  ["bottom:-3px", "left:" + CORNER + "px", "right:" + CORNER + "px", "height:" + EDGE + "px", "cursor:ns-resize"],
-      w:  ["left:-3px", "top:" + CORNER + "px", "bottom:" + CORNER + "px", "width:" + EDGE + "px", "cursor:ew-resize"],
-      e:  ["right:-3px", "top:" + CORNER + "px", "bottom:" + CORNER + "px", "width:" + EDGE + "px", "cursor:ew-resize"],
-      nw: ["top:-3px", "left:-3px", "width:" + CORNER + "px", "height:" + CORNER + "px", "cursor:nwse-resize"],
-      ne: ["top:-3px", "right:-3px", "width:" + CORNER + "px", "height:" + CORNER + "px", "cursor:nesw-resize"],
-      sw: ["bottom:-3px", "left:-3px", "width:" + CORNER + "px", "height:" + CORNER + "px", "cursor:nesw-resize"],
-      se: ["bottom:-3px", "right:-3px", "width:" + CORNER + "px", "height:" + CORNER + "px", "cursor:nwse-resize"]
-    };
-    var handles = [];
-    wrap.appendChild(bar);
-    wrap.appendChild(cnv);
-    wrap.appendChild(status);
-    Object.keys(handleDefs).forEach(function (dir) {
-      var h = document.createElement("div");
-      h.dataset.resize = dir;
-      h.title = "растянуть";
-      h.style.cssText = ["position:absolute", "z-index:2", "pointer-events:auto", "touch-action:none", "background:transparent"]
-        .concat(handleDefs[dir]).join(";");
-      if (dir === "se") {
-        // visible grip in the bottom-right corner
-        h.style.background = "linear-gradient(135deg,transparent 0 55%,#8fd 55% 62%,transparent 62% 72%,#8fd 72% 79%,transparent 79%)";
-      }
-      wrap.appendChild(h);
-      handles.push(h);
-    });
-    wrap.style.position = "fixed";
-    (document.body || document.documentElement).appendChild(wrap);
-    minimap.wrap = wrap;
-    minimap.canvas = cnv;
-    minimap.statusEl = status;
-
-    // Pin the box by left/top so dragging the left/top edge works even when it was anchored to the right.
-    function pinLeftTop() {
-      var r = wrap.getBoundingClientRect();
-      wrap.style.left = r.left + "px";
-      wrap.style.top = r.top + "px";
-      wrap.style.right = "auto";
-      minimap.left = r.left;
-      minimap.top = r.top;
-      return r;
-    }
-
-    // One gesture at a time: "move" from the title bar, "resize" from an edge/corner.
-    var gesture = null;
-    function onGestureMove(ev) {
-      if (!gesture) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      var dx = ev.clientX - gesture.x0, dy = ev.clientY - gesture.y0;
-      var vw = window.innerWidth || 1e4, vh = window.innerHeight || 1e4;
-      if (gesture.kind === "move") {
-        var x = Math.max(0, Math.min(vw - 40, gesture.left0 + dx));
-        var y = Math.max(0, Math.min(vh - 20, gesture.top0 + dy));
-        wrap.style.left = x + "px";
-        wrap.style.top = y + "px";
-        wrap.style.right = "auto";
-        minimap.left = x;
-        minimap.top = y;
-        return;
-      }
-      var d = gesture.dir, left = gesture.left0, top = gesture.top0;
-      var w = gesture.w0, h = gesture.h0;
-      if (d.indexOf("e") >= 0) w = clampMinimapDim(gesture.w0 + dx);
-      if (d.indexOf("s") >= 0) h = clampMinimapDim(gesture.h0 + dy);
-      if (d.indexOf("w") >= 0) {
-        w = clampMinimapDim(gesture.w0 - dx);
-        left = gesture.left0 + (gesture.w0 - w);
-      }
-      if (d.indexOf("n") >= 0) {
-        h = clampMinimapDim(gesture.h0 - dy);
-        top = gesture.top0 + (gesture.h0 - h);
-      }
-      if (left < 0) { if (d.indexOf("w") >= 0) w = clampMinimapDim(w + left); left = 0; }
-      if (top < 0) { if (d.indexOf("n") >= 0) h = clampMinimapDim(h + top); top = 0; }
-      minimap.w = w;
-      minimap.h = h;
-      minimap.left = left;
-      minimap.top = top;
-      wrap.style.left = left + "px";
-      wrap.style.top = top + "px";
-      wrap.style.right = "auto";
-      applyMinimapSize();
-      try { drawMinimap(); } catch (eRz) {}
-    }
-    function onGestureEnd(ev) {
-      if (!gesture) return;
-      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
-      try { if (gesture.el.releasePointerCapture) gesture.el.releasePointerCapture(gesture.pid); } catch (eRel) {}
-      gesture = null;
-      minimap.dragging = false;
-      minimap.resizing = false;
-      document.documentElement.style.cursor = "";
-      saveMinimapLayout();
-    }
-    function startGesture(ev, kind, el, dir) {
-      if (ev.button !== 0 || gesture) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      var r = pinLeftTop();
-      gesture = {
-        kind: kind, dir: dir || "", el: el, pid: ev.pointerId,
-        x0: ev.clientX, y0: ev.clientY,
-        left0: r.left, top0: r.top,
-        w0: minimap.w || MINIMAP_SIZE, h0: minimap.h || MINIMAP_SIZE
-      };
-      minimap.dragging = kind === "move";
-      minimap.resizing = kind === "resize";
-      if (kind === "resize") document.documentElement.style.cursor = el.style.cursor;
-      try { el.setPointerCapture(ev.pointerId); } catch (eCap) {}
-    }
-    handles.forEach(function (h) {
-      h.addEventListener("pointerdown", function (ev) { startGesture(ev, "resize", h, h.dataset.resize); });
-      h.addEventListener("pointermove", onGestureMove);
-      h.addEventListener("pointerup", onGestureEnd);
-      h.addEventListener("pointercancel", onGestureEnd);
-      h.addEventListener("lostpointercapture", function () { onGestureEnd(null); });
-    });
-    bar.addEventListener("pointerdown", function (ev) {
-      if (ev.target && ev.target.tagName === "BUTTON") return;
-      startGesture(ev, "move", bar);
-    });
-    bar.addEventListener("pointermove", onGestureMove);
-    bar.addEventListener("pointerup", onGestureEnd);
-    bar.addEventListener("pointercancel", onGestureEnd);
-    bar.addEventListener("lostpointercapture", function () { onGestureEnd(null); });
-    // Fallback if pointer capture is refused: follow the mouse on the window while a gesture is active.
-    if (!minimap._gestureWinBound) {
-      minimap._gestureWinBound = true;
-      window.addEventListener("pointermove", function (ev) { if (minimap._gestureMove) minimap._gestureMove(ev); }, true);
-      window.addEventListener("pointerup", function (ev) { if (minimap._gestureEnd) minimap._gestureEnd(ev); }, true);
-    }
-    minimap._gestureMove = function (ev) { if (gesture && ev.target !== gesture.el) onGestureMove(ev); };
-    minimap._gestureEnd = function (ev) { if (gesture && ev.target !== gesture.el) onGestureEnd(ev); };
-
-    wrap.addEventListener("pointerenter", function () { minimap.hover = true; });
-    wrap.addEventListener("pointerleave", function () { if (!minimap.resizing && !minimap.dragging) minimap.hover = false; });
-    wrap.addEventListener("mouseenter", function () { minimap.hover = true; });
-    wrap.addEventListener("mouseleave", function () { if (!minimap.resizing && !minimap.dragging) minimap.hover = false; });
-    // Keep clicks on the map away from the game, but in the bubble phase so our own children still get them.
-    ["pointerdown", "pointermove", "pointerup", "mousedown", "mouseup", "mousemove", "click", "wheel", "contextmenu"].forEach(function (type) {
-      wrap.addEventListener(type, function (ev) { ev.stopPropagation(); });
-    });
-    btnZoomIn.addEventListener("click", function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      bumpMinimapZoom(1.25);
-      try { drawMinimap(); } catch (eZ) {}
-    });
-    btnZoomOut.addEventListener("click", function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      bumpMinimapZoom(1 / 1.25);
-      try { drawMinimap(); } catch (eZ2) {}
-    });
-    cnv.addEventListener("wheel", function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      bumpMinimapZoom(ev.deltaY > 0 ? 1 / 1.15 : 1.15);
-      try { drawMinimap(); } catch (eW) {}
-    }, { passive: false });
-    updateMinimapChrome();
-    wrap._toCoordsOk = true;
-    return wrap;
-  }
-
-  function setMinimapOn(on) {
-    minimap.on = !!on;
-    var el = document.getElementById(MINIMAP_ID);
-    if (!minimap.on) {
-      if (el) el.style.display = "none";
-      return;
-    }
-    ensureMinimap();
-    if (minimap.wrap) minimap.wrap.style.display = "block";
-    if (!minimap.offscreen) maybeStartMapCache();
-  }
-
-  function minimapApi(arg) {
-    if (arg === true || arg === false) {
-      setMinimapOn(arg);
-    } else if (arg && typeof arg === "object") {
-      if (arg.zoom != null && isFiniteNum(Number(arg.zoom))) minimap.zoom = Math.max(0.25, Number(arg.zoom));
-      if (arg.follow != null) minimap.follow = !!arg.follow;
-      if (arg.drive != null) minimap.drive = !!arg.drive;
-      if (arg.size != null && MINIMAP_PRESETS[arg.size]) applyMinimapPreset(arg.size);
-      if (arg.follow != null || arg.zoom != null) saveMinimapLayout();
-      if (arg.flipX != null) minimap.flipX = !!arg.flipX;
-      if (arg.flipY != null) minimap.flipY = !!arg.flipY;
-      if (arg.rotate != null && isFiniteNum(Number(arg.rotate))) minimap.rotate = Number(arg.rotate);
-      if (arg.on != null) setMinimapOn(!!arg.on);
-      if (arg.flipX != null || arg.flipY != null || arg.rotate != null) {
-        minimap.builtFor = null;
-        try { rebuildMinimapOffscreen(); } catch (e) {}
-      }
-    }
-    if (minimap.on) {
-      ensureMinimap();
-      try { drawMinimap(); } catch (e2) {}
-    }
-    return {
-      on: minimap.on,
-      zoom: minimap.zoom,
-      follow: minimap.follow,
-      flipX: minimap.flipX,
-      flipY: minimap.flipY,
-      rotate: minimap.rotate,
-      mapId: mapCache.id,
-      source: mapCache.source,
-      status: mapCache.status,
-      drive: !!minimap.drive,
-      size: { w: minimap.w, h: minimap.h }
-    };
-  }
-
-  function rayDistToRect(px, py, dx, dy, left, right, bottom, top) {
-    var tMin = Infinity, t, y, x, eps = 1e-9;
-    if (Math.abs(dx) > eps) {
-      t = (left - px) / dx;
-      if (t > 0) { y = py + t * dy; if (y >= bottom && y <= top && t < tMin) tMin = t; }
-      t = (right - px) / dx;
-      if (t > 0) { y = py + t * dy; if (y >= bottom && y <= top && t < tMin) tMin = t; }
-    }
-    if (Math.abs(dy) > eps) {
-      t = (bottom - py) / dy;
-      if (t > 0) { x = px + t * dx; if (x >= left && x <= right && t < tMin) tMin = t; }
-      t = (top - py) / dy;
-      if (t > 0) { x = px + t * dx; if (x >= left && x <= right && t < tMin) tMin = t; }
-    }
-    return isFinite(tMin) ? tMin : 0;
-  }
-
-  function setMinimapZoom(z) {
-    z = Number(z);
-    if (!isFinite(z)) return;
-    if (z < 0.5) z = 0.5;
-    if (z > 16) z = 16;
-    minimap.zoom = z;
-    try { clearTimeout(setMinimapZoom.t); } catch (e) {}
-    setMinimapZoom.t = setTimeout(saveMinimapLayout, 400);
-  }
-
-  function bumpMinimapZoom(factor) {
-    setMinimapZoom((minimap.zoom || 1) * factor);
-  }
-
-  // Own tank: fixed-size white arrow along the hull (not the barrel), so it
-  // reads the same at any zoom and never looks like another map object.
-  function drawSelfArrow(ctx, x, y, dx, dy) {
-    drawArrow(ctx, x, y, dx, dy, "#ffffff", "#000000", 1);
-  }
-
-  function drawArrow(ctx, x, y, dx, dy, fill, stroke, k) {
-    var len = Math.sqrt(dx * dx + dy * dy) || 1;
-    dx /= len; dy /= len;
-    var nx = -dy, ny = dx, L = 11 * k, B = 7 * k, T = 4 * k;
-    ctx.beginPath();
-    ctx.moveTo(x + dx * L, y + dy * L);                        // nose
-    ctx.lineTo(x - dx * L * 0.7 + nx * B, y - dy * L * 0.7 + ny * B);
-    ctx.lineTo(x - dx * T, y - dy * T);                        // notch
-    ctx.lineTo(x - dx * L * 0.7 - nx * B, y - dy * L * 0.7 - ny * B);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    ctx.stroke();
-    ctx.fill();
-  }
-
-  function drawMinimap() {
-    if (!minimap.on) return;
-    var wrap = ensureMinimap();
-    if (!wrap || !minimap.canvas) return;
-    if (mapCache.data && !minimap.offscreen) {
-      try { rebuildMinimapOffscreen(); } catch (e) {}
-    }
-    applyMinimapSize();
-    var ctx = minimap.canvas.getContext("2d");
-    var W = minimap.canvas.width, H = minimap.canvas.height;
-    var S = Math.min(W, H);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = "#141412";
-    ctx.fillRect(0, 0, W, H);
-    var b = minimap.bounds;
-    var off = minimap.offscreen;
-    var viewM = 1, cx, cy, metresW, metresH;
-    if (off && b) {
-      var zoom = Math.max(0.25, minimap.zoom || 1);
-      var spanX = b.xmax - b.xmin, spanY = b.ymax - b.ymin;
-      var fit = Math.min(W / spanX, H / spanY);
-      viewM = fit * zoom;
-      var tank = lastMe;
-      if (minimap.follow && zoom > 1.001 && tank && isFiniteNum(tank.x)) {
-        cx = tank.x;
-        cy = tank.y;
-      } else {
-        cx = (b.xmin + b.xmax) / 2;
-        cy = (b.ymin + b.ymax) / 2;
-      }
-      metresW = W / viewM;
-      metresH = H / viewM;
-      var worldL = cx - metresW / 2, worldT = cy + metresH / 2;
-      var src = mapWorldToOff(worldL, worldT, b);
-      var srcW = metresW * b.scale, srcH = metresH * b.scale;
-      try {
-        ctx.imageSmoothingEnabled = true;
-        var tankZ = lastMe && isFiniteNum(lastMe.z) ? lastMe.z : null;
-        var splitZ = minimap.splitZ || 2.4;
-        var onHigh = tankZ != null && tankZ >= splitZ - 0.35;
-        var low = minimap.layerLow, high = minimap.layerHigh;
-        if (minimap.drive && minimap.driveCanvas) {
-          ctx.drawImage(minimap.driveCanvas, src.x, src.y, srcW, srcH, 0, 0, W, H);
-        } else if (low && high && !mapCache.texture) {
-          ctx.globalAlpha = onHigh ? 0.35 : 1;
-          ctx.drawImage(low, src.x, src.y, srcW, srcH, 0, 0, W, H);
-          ctx.globalAlpha = onHigh ? 1 : 0.42;
-          ctx.drawImage(high, src.x, src.y, srcW, srcH, 0, 0, W, H);
-          ctx.globalAlpha = 1;
-        } else {
-          ctx.drawImage(off, src.x, src.y, srcW, srcH, 0, 0, W, H);
-        }
-        if (minimap.outlines) {
-          ctx.drawImage(minimap.outlines, src.x, src.y, srcW, srcH, 0, 0, W, H);
-        }
-        minimap.levelLabel = onHigh ? "верх" : (tankZ == null ? "" : "низ");
-      } catch (e2) {
-        ctx.globalAlpha = 1;
-        ctx.drawImage(off, 0, 0, off.width, off.height, 0, 0, W, H);
-        if (minimap.outlines) ctx.drawImage(minimap.outlines, 0, 0, off.width, off.height, 0, 0, W, H);
-        viewM = Math.min(W / spanX, H / spanY);
-        cx = (b.xmin + b.xmax) / 2;
-        cy = (b.ymin + b.ymax) / 2;
-      }
-    }
-    function toScreen(x, y) {
-      if (!b) return { x: W / 2, y: H / 2 };
-      return { x: W / 2 + (x - cx) * viewM, y: H / 2 - (y - cy) * viewM };
-    }
-    try { drawObjectives(ctx, toScreen, W, H); } catch (eObj) {}
-    try { drawRadarTanks(ctx, toScreen, W, H); } catch (eRadar) {}
-    try { drawFlagCarriers(ctx, toScreen, W, H); } catch (eCar) {}
-    try { drawMagnumAim(ctx, toScreen); } catch (eMag) {}
-    if (lastMe && isFiniteNum(lastMe.x) && !isFiniteNum(lastMe.heading)) {
-      // position known, heading not yet (standing still, hull not matched): a dot
-      try {
-        var pd = toScreen(lastMe.x, lastMe.y);
-        ctx.beginPath();
-        ctx.arc(pd.x, pd.y, 6, 0, Math.PI * 2);
-        ctx.fillStyle = "#ffffff";
-        ctx.strokeStyle = "#000000";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        ctx.fill();
-      } catch (eDot) {}
-    }
-    if (lastMe && isFiniteNum(lastMe.x) && isFiniteNum(lastMe.heading)) try {
-      var hx = Math.cos(lastMe.heading), hy = Math.sin(lastMe.heading);
-      var px = lastMe.x, py = lastMe.y;
-      var p = toScreen(px, py);
-      var bdir = lastRayDebug && lastRayDebug.barrel && lastRayDebug.barrel.forward;
-      var yawX = bdir && isFiniteNum(bdir.x) ? bdir.x : hx;
-      var yawY = bdir && isFiniteNum(bdir.y) ? bdir.y : hy;
-      var blen = Math.sqrt(yawX * yawX + yawY * yawY) || 1;
-      yawX /= blen;
-      yawY /= blen;
-      var rayM = null;
-      if (lastAhead && lastAhead.barrel && isFiniteNum(lastAhead.barrel.dist) && lastAhead.barrel.dist > 0) {
-        rayM = lastAhead.barrel.dist;
-      }
-      if (rayM == null) {
-        var left = cx - (metresW || 0) / 2, right = cx + (metresW || 0) / 2;
-        var bottom = cy - (metresH || 0) / 2, top = cy + (metresH || 0) / 2;
-        if (!isFinite(left) && b) {
-          left = b.xmin; right = b.xmax; bottom = b.ymin; top = b.ymax;
-        }
-        rayM = rayDistToRect(px, py, yawX, yawY, left, right, bottom, top);
-        if (!rayM || rayM < 1) rayM = 200;
-      }
-      var end = toScreen(px + yawX * rayM, py + yawY * rayM);
-      ctx.strokeStyle = "#ffcc33";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(end.x, end.y);
-      ctx.stroke();
-      drawSelfArrow(ctx, p.x, p.y, hx, -hy); // screen y grows down
-    } catch (eSelf) {}
-    if (b && viewM) {
-      var barM = niceMetres((W / viewM));
-      var barPx = barM * viewM;
-      var bx = 8, by = H - 12;
-      ctx.strokeStyle = "#e8edf2";
-      ctx.fillStyle = "#e8edf2";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(bx, by);
-      ctx.lineTo(bx + barPx, by);
-      ctx.moveTo(bx, by - 3);
-      ctx.lineTo(bx, by + 3);
-      ctx.moveTo(bx + barPx, by - 3);
-      ctx.lineTo(bx + barPx, by + 3);
-      ctx.stroke();
-      ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
-      ctx.fillText(barM + " м", bx, by - 5);
-    }
-    if (minimap.levelLabel) {
-      ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
-      ctx.fillStyle = "#e8edf2";
-      ctx.fillText("этаж: " + minimap.levelLabel, W - 70, H - 8);
-    }
-    updateMinimapChrome();
-  }
-
-  /* ---------- in-game HUD radar mirror ----------
-   * Mirrors ONLY the markers the game's own HUD radar is showing right now
-   * (radar system: n11x_1 = list of Entry{t11x_1 entity, u11x_1 marker}).
-   * The game adds a marker when a tank is inside RadarCC.enterRange and drops it
-   * past exitRange or when the radar is locked, so we show exactly the same set.
-   * No other tank positions are read. */
-  // Accepts 0xRRGGBB, 0xAARRGGBB, "#rrggbb"/"rgb()" strings, or {r,g,b} (0..1 or 0..255).
   function colorToRgb(v) {
     if (v == null) return null;
     if (typeof v === "number" && isFinite(v)) {
@@ -5041,14 +3290,13 @@ function triNormalZ(w) {
         var k = (r <= 1 && g <= 1 && b <= 1) ? 255 : 1;
         return { r: r * k, g: g * k, b: b * k };
       }
-      // Minified game Color object (cC(0xRRGGBB)): look at its own numeric fields in declaration order.
       var keys, i, val, nums = [], ints = [];
       try { keys = Object.keys(v); } catch (eK) { keys = []; }
       for (i = 0; i < keys.length; i++) {
         try { val = v[keys[i]]; } catch (eV) { continue; }
         if (!isFiniteNum(val)) continue;
         var rgb24 = (val >>> 0) & 0xFFFFFF;
-        if (val > 255 && (rgb24 === 0x33BBFF || rgb24 === 0xFF6666)) return colorToRgb(rgb24);
+        if (val > 255 && (rgb24 === GAME.radarTints.ally || rgb24 === GAME.radarTints.enemy)) return colorToRgb(rgb24);
         if (val > 255 && val === Math.floor(val)) ints.push(val);
         nums.push(val);
       }
@@ -5071,9 +3319,9 @@ function triNormalZ(w) {
 
   function looksLikeRadarSystem(obj) {
     try {
-      var list = obj && obj.n11x_1;
-      if (!list || typeof list.e1 !== "function" || typeof list.g1 !== "function") return false;
-      if (!obj.o11x_1 || !obj.q11x_1 || !obj.r11x_1 || typeof obj.g11x_1 !== "boolean") return false;
+      var list = obj && obj[G.radarEntries];
+      if (!list || typeof list[G.size] !== "function" || typeof list[G.get] !== "function") return false;
+      if (!obj[G.radarPartA] || !obj[G.radarPartB] || !obj[G.radarPartC] || typeof obj[G.radarFlag] !== "boolean") return false;
       return true;
     } catch (e) { return false; }
   }
@@ -5088,26 +3336,23 @@ function triNormalZ(w) {
   function radarMarkers() {
     var sys = hooks.radarSystem, out = [];
     if (!sys) return out;
-    var entries = iterList(sys.n11x_1), i, e, m, pos, col;
+    var entries = iterList(sys[G.radarEntries]), i, e, m, pos, col;
     for (i = 0; i < entries.length && i < 64; i++) {
       e = entries[i];
-      m = e && e.u11x_1;
+      m = e && e[G.entryMarker];
       if (!m) continue;
       pos = null;
-      try { pos = vecToM(parseMapVec(m.o11w_1 || (typeof m.n7v === "function" && m.n7v()))); } catch (eP) {}
+      try { pos = vecToM(parseMapVec(m[G.markerPos] || (typeof m[G.getPosition] === "function" && m[G.getPosition]()))); } catch (eP) {}
       if (!pos || !isFiniteNum(pos.x) || !isFiniteNum(pos.y)) continue;
       col = null;
-      try { col = m.q11w_1 && m.q11w_1.d4q_1; } catch (eC) {}
-      // Game tints allies bluish (0x33BBFF) and enemies reddish (0xFF6666); the relation is chosen by the game.
-      out.push({ pos: pos, ally: radarColorIsAlly(col), raw: col, key: (e.t11x_1 && typeof e.t11x_1 === "object") ? e.t11x_1 : m });
+      try { col = m[G.markerSprite] && m[G.markerSprite][G.spriteTint]; } catch (eC) {}
+      out.push({ pos: pos, ally: radarColorIsAlly(col), raw: col, key: (e[G.entryEntity] && typeof e[G.entryEntity] === "object") ? e[G.entryEntity] : m });
     }
     return out;
   }
 
-  // Direction of travel of a radar marker, from the positions the game radar
-  // itself showed over time (no other data about that tank is read).
   var radarTrack = typeof WeakMap === "function" ? new WeakMap() : null;
-  var RADAR_STEP_M = 0.6;      // re-aim after moving this far
+  var RADAR_STEP_M = 0.6;
   function radarHeading(t, now) {
     if (!radarTrack || !t.key) return null;
     var tr = radarTrack.get(t.key), x = t.pos.x, y = t.pos.y;
@@ -5121,16 +3366,12 @@ function triNormalZ(w) {
       tr.dx = mx / n; tr.dy = my / n;
       tr.ax = x; tr.ay = y; tr.movedAt = now;
     }
-    // A tank that stopped keeps its last direction of travel; a dot only until
-    // the radar has seen it move at least once.
     if (!tr.movedAt) return null;
     return { x: tr.dx, y: tr.dy };
   }
 
-  // Carrier of a flag whose marker the game shows: the tank stays an arrow
-  // (its colour = the side carrying), with a blinking flag of the carried team.
   function carriedFlags() {
-    return flagLiveStates().filter(function (f) { return f.state === "CARRIED"; });
+    return flagLiveStates().filter(function (f) { return f.state === GAME.flagStates.carried; });
   }
   function nearCarriedFlag(pos, carried) {
     for (var i = 0; i < carried.length; i++) {
@@ -5138,287 +3379,6 @@ function triNormalZ(w) {
     }
     return null;
   }
-  function drawBlinkingFlag(ctx, x, y, color) {
-    var on = Math.floor(Date.now() / 250) % 2 === 0;
-    ctx.save();
-    ctx.globalAlpha = on ? 1 : 0.3;
-    ctx.lineJoin = "round";
-    // pole
-    ctx.beginPath();
-    ctx.moveTo(x, y); ctx.lineTo(x, y - 18);
-    ctx.strokeStyle = "#000"; ctx.lineWidth = 4; ctx.stroke();
-    ctx.strokeStyle = "#ffd400"; ctx.lineWidth = 2; ctx.stroke();
-    // cloth
-    ctx.beginPath();
-    ctx.moveTo(x, y - 18); ctx.lineTo(x + 13, y - 13.5); ctx.lineTo(x, y - 9); ctx.closePath();
-    ctx.fillStyle = color;
-    ctx.strokeStyle = "#ffd400"; ctx.lineWidth = 2;
-    ctx.fill(); ctx.stroke();
-    ctx.restore();
-  }
-  function drawFlagCarriers(ctx, toScreen, W, H) {
-    var carried = carriedFlags();
-    if (!carried.length) return;
-    var markers = radarMarkers(), now = Date.now(), i, j, f, p, hd, carrierTeam, local, col;
-    for (i = 0; i < carried.length; i++) {
-      f = carried[i];
-      p = toScreen(f.pos.x, f.pos.y);
-      if (p.x < -30 || p.y < -30 || p.x > W + 30 || p.y > H + 30) continue;
-      local = f.local || localTeamName();
-      carrierTeam = f.team === "TEAM_A" || f.team === "TEAM_B" ? otherTeam(f.team) : "";
-      col = carrierTeam ? cpTeamColor(carrierTeam, local) : "#c8c8c8";
-      // direction: how the flag marker moves; else the radar marker of the carrier
-      hd = radarHeading({ key: f.key, pos: f.pos }, now);
-      for (j = 0; !hd && j < markers.length; j++) {
-        if (Math.abs(markers[j].pos.x - f.pos.x) < 4 && Math.abs(markers[j].pos.y - f.pos.y) < 4) hd = radarHeading(markers[j], now);
-      }
-      if (hd) {
-        drawArrow(ctx, p.x, p.y, hd.x, -hd.y, col, "rgba(0,0,0,0.85)", 0.95);
-      } else {
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2);
-        ctx.fillStyle = col; ctx.strokeStyle = "rgba(0,0,0,0.85)"; ctx.lineWidth = 1.5;
-        ctx.fill(); ctx.stroke();
-      }
-      drawBlinkingFlag(ctx, p.x + 6, p.y - 4, cpTeamColor(f.team, local));
-    }
-  }
-
-  function drawRadarTanks(ctx, toScreen, W, H) {
-    var list = radarMarkers();
-    if (!list.length) return;
-    var carriedNow = carriedFlags();
-    var meZ = lastMe && isFiniteNum(lastMe.z) ? lastMe.z : null;
-    var now = Date.now();
-    var i, t, p, hex, dz, hd;
-    ctx.save();
-    for (i = 0; i < list.length; i++) {
-      t = list[i];
-      hd = radarHeading(t, now);
-      if (carriedNow.length && nearCarriedFlag(t.pos, carriedNow)) continue; // drawn as the carrier
-      p = toScreen(t.pos.x, t.pos.y);
-      if (p.x < -10 || p.y < -10 || p.x > W + 10 || p.y > H + 10) continue;
-      hex = t.ally === true ? "#1e6bff" : (t.ally === false ? "#ff2a2a" : "#c8c8c8");
-      if (hd) {
-        drawArrow(ctx, p.x, p.y, hd.x, -hd.y, hex, "rgba(0,0,0,0.85)", 0.85); // screen y grows down
-      } else {
-        ctx.fillStyle = hex;
-        ctx.strokeStyle = "rgba(0,0,0,0.85)";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-      }
-      // same above/below hint as the game radar (4.8 m threshold)
-      dz = meZ != null ? t.pos.z - meZ : 0;
-      if (Math.abs(dz) > 4.8) {
-        ctx.fillStyle = "#ffffff";
-        ctx.beginPath();
-        if (dz > 0) { ctx.moveTo(p.x - 3, p.y - 7); ctx.lineTo(p.x + 3, p.y - 7); ctx.lineTo(p.x, p.y - 11); }
-        else { ctx.moveTo(p.x - 3, p.y + 7); ctx.lineTo(p.x + 3, p.y + 7); ctx.lineTo(p.x, p.y + 11); }
-        ctx.closePath();
-        ctx.fill();
-      }
-    }
-    ctx.restore();
-  }
-
-  // Control point as the game's HUD shows it: filled with the owner's colour,
-  // ring = capture progress (|score| / 100) in the colour of the side capturing.
-  function drawCpLive(ctx, p, st, letter) {
-    var r = 9, ring = r + 4.5, TAU = Math.PI * 2, frac = Math.abs(st.score) / 100;
-    ctx.globalAlpha = st.active ? 1 : 0.45;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, ring, 0, TAU);
-    ctx.strokeStyle = "rgba(0,0,0,0.8)";
-    ctx.lineWidth = 5.5;
-    ctx.stroke();
-    if (frac > 0.005) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, ring, -Math.PI / 2, -Math.PI / 2 + Math.min(1, frac) * TAU);
-      ctx.strokeStyle = cpTeamColor(st.capTeam, st.local);
-      ctx.lineWidth = 3.5;
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, TAU);
-    ctx.fillStyle = cpTeamColor(st.owner, st.local);
-    ctx.fill();
-    ctx.strokeStyle = "rgba(0,0,0,0.85)";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(letter || st.letter || "?", p.x, p.y + 0.5);
-    ctx.globalAlpha = 1;
-  }
-
-  function drawObjectives(ctx, toScreen, W, H) {
-    var live = cpLiveStates(), liveUsed = [];
-    function liveAt(pos) {
-      var j, d, best = -1, bestD = 9; // within 3 m
-      for (j = 0; j < live.length; j++) {
-        if (liveUsed[j]) continue;
-        d = (live[j].pos.x - pos.x) * (live[j].pos.x - pos.x) + (live[j].pos.y - pos.y) * (live[j].pos.y - pos.y);
-        if (d < bestD) { bestD = d; best = j; }
-      }
-      if (best < 0) return null;
-      liveUsed[best] = true;
-      return live[best];
-    }
-    // Only what this battle has: flag bases found live (CTF) and control points
-    // found live (CP mode). Objectives stored in map files are not drawn: a map
-    // file is shared by all modes (its DOM spawn points are not control points).
-    var list = [], i0, cp, tp, tpos;
-    for (i0 = 0; i0 < mapTeamPoints.length; i0++) {
-      tp = mapTeamPoints[i0];
-      try {
-        if (!tp || tp.oir_1 != null) continue;
-        tpos = vecToM(parseMapVec(tp.xin_1));
-        if (tpos) list.push({ kind: "flag", team: normalizeTeam(enumName(tp.zin_1)), letter: "F", position: tpos });
-      } catch (eTp) {}
-    }
-    for (i0 = 0; i0 < mapControlPoints.length; i0++) {
-      cp = mapControlPoints[i0];
-      if (!cp || !cp.position) continue;
-      list.push({ kind: "cp", team: null, letter: cp.letter || "?", position: cp.position });
-    }
-    if (!list.length && !live.length && !flagLive.length) return;
-    var now = Date.now();
-    var i, o, p, style, taken, blink, r, letter, st;
-    ctx.save();
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.font = "bold 11px ui-sans-serif, system-ui, sans-serif";
-    for (i = 0; i < list.length; i++) {
-      o = list[i];
-      if (!o || !o.position) continue;
-      p = toScreen(o.position.x, o.position.y);
-      if (p.x < -20 || p.y < -20 || p.x > W + 20 || p.y > H + 20) continue;
-      letter = o.letter || (o.kind === "flag" ? "F" : "?");
-      if (o.kind === "flag") {
-        style = teamStyle(o.team);
-        if (o.team === "TEAM_A" || o.team === "TEAM_B") {
-          var fc = cpTeamColor(o.team, localTeamName());
-          style = { fill: fc, stroke: "#ffffff", key: o.team };
-        }
-        taken = !!flagTaken[normalizeTeam(o.team)];
-        blink = taken && ((now / 180) % 2 < 1);
-        r = 8;
-        ctx.globalAlpha = taken && !blink ? 0.28 : 1;
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y - r - 2);
-        ctx.lineTo(p.x + r, p.y + r - 1);
-        ctx.lineTo(p.x - r, p.y + r - 1);
-        ctx.closePath();
-        ctx.fillStyle = style.fill;
-        ctx.strokeStyle = taken ? "#fff" : style.stroke;
-        ctx.lineWidth = taken ? 2.5 : 1.5;
-        ctx.fill();
-        ctx.stroke();
-        if (taken) {
-          ctx.strokeStyle = "#fff";
-          ctx.lineWidth = 1.25;
-          ctx.beginPath();
-          ctx.arc(p.x, p.y + 1, r + 3, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-        ctx.fillStyle = "#fff";
-        ctx.fillText(letter, p.x, p.y + 1);
-        ctx.globalAlpha = 1;
-      } else if ((st = liveAt(o.position))) {
-        drawCpLive(ctx, p, st, o.letter && o.letter !== "?" ? o.letter : st.letter);
-      } else {
-        r = 7;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(20,20,20,0.75)";
-        ctx.strokeStyle = "#ffe56a";
-        ctx.lineWidth = 2;
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#ffe56a";
-        ctx.fillText(letter, p.x, p.y + 0.5);
-      }
-    }
-    // flags as the game's markers show them: carrier = yellow ring, dropped = flag
-    var fl = flagLiveStates(), fi, fs;
-    for (fi = 0; fi < fl.length; fi++) {
-      fs = fl[fi];
-      p = toScreen(fs.pos.x, fs.pos.y);
-      if (p.x < -20 || p.y < -20 || p.x > W + 20 || p.y > H + 20) continue;
-      var fcol = cpTeamColor(fs.team, fs.local);
-      if (fs.state === "CARRIED") {
-        continue; // drawn by drawFlagCarriers on top of the radar tanks
-      } else {
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y - 10); ctx.lineTo(p.x + 8, p.y + 6); ctx.lineTo(p.x - 8, p.y + 6); ctx.closePath();
-        ctx.fillStyle = fcol;
-        ctx.strokeStyle = "#ffd400";
-        ctx.lineWidth = 2;
-        ctx.fill();
-        ctx.stroke();
-      }
-    }
-    // live points the map file did not know about
-    for (i = 0; i < live.length; i++) {
-      if (liveUsed[i]) continue;
-      p = toScreen(live[i].pos.x, live[i].pos.y);
-      if (p.x < -20 || p.y < -20 || p.x > W + 20 || p.y > H + 20) continue;
-      drawCpLive(ctx, p, live[i], live[i].letter);
-    }
-    ctx.restore();
-  }
-
-  function minimapFlash(text) {
-    minimap.flash = { text: text, until: Date.now() + 1500 };
-    try { updateMinimapChrome(); } catch (e) {}
-  }
-
-  function onMinimapHotkey(ev) {
-    if (!ev) return;
-    var kc = ev.code, plus = kc === "Equal" || kc === "NumpadAdd", minus = kc === "Minus" || kc === "NumpadSubtract";
-    var tgt = ev.target, typing = tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable);
-    if ((plus || minus) && !typing && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
-      if (ev.shiftKey) {
-        // Shift + / - : camera distance, parkour format only
-        if (OFF.camera) { minimapFlash("камера: выключена (toCoords.off)"); return; }
-        if (!isParkour()) {
-          minimapFlash(parkourKnown() ? "камера: только в паркуре (формат боя: " + battleFormatName() + ")" : "камера: ищу формат боя…");
-          return;
-        }
-        if (!followCam) { minimapFlash("камера: ещё ищу…"); return; }
-        bumpParkourCam(plus ? 1.15 : 1 / 1.15);
-        ev.preventDefault();
-        ev.stopPropagation();
-        return;
-      }
-      // + / - : map zoom (clicks and the wheel do not reach the map while the
-      // game holds the mouse, keys always do)
-      if (minimap.on) {
-        bumpMinimapZoom(plus ? 1.25 : 0.8);
-        try { drawMinimap(); } catch (eZk) {}
-        minimapFlash("масштаб ×" + (Math.round(minimap.zoom * 100) / 100));
-        ev.preventDefault();
-        ev.stopPropagation();
-        return;
-      }
-    }
-    if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
-    var t = ev.target;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-    if ((ev.key === "[" || ev.key === "]" || ev.code === "BracketLeft" || ev.code === "BracketRight") && minimap.on && minimap.hover) {
-      bumpMinimapSize(ev.key === "]" || ev.code === "BracketRight" ? 1.25 : 0.8);
-      ev.preventDefault();
-      ev.stopPropagation();
-      return;
-    }
-    if (ev.key !== "m" && ev.key !== "M") return;
-    setMinimapOn(!minimap.on);
-    ev.preventDefault();
-    ev.stopPropagation();
-  }
-
 
   function livePositionOk() {
     try {
@@ -5439,10 +3399,9 @@ function triNormalZ(w) {
     hooks.radarSystem = null;
     radarScanRuns = 0;
     if (dropFns) {
-      hooks.getLocalTankPosition = null;
-      hooks.isLocalTankAlive = null;
-      hooks.showPositionLocalTank = null;
-      hooks.fillPhysicsState = null;
+      hooks.localTankPosition = null;
+      hooks.localTankAlive = null;
+      hooks.printLocalTankPosition = null;
     }
     bodyCandidates = [];
     mountCandidates = [];
@@ -5484,15 +3443,6 @@ function triNormalZ(w) {
     mapCache.building = false;
     mapCache.started = false;
     mapCache.status = "жду бой";
-    mapCache.texture = null;
-    mapCache.textureId = null;
-    minimap.offscreen = null;
-    minimap.layerLow = null;
-    minimap.layerHigh = null;
-    minimap.splitZ = 0;
-    minimap.bounds = null;
-    minimap.builtFor = null;
-    minimap.levelLabel = "";
   }
 
   function startScanBurst(why) {
@@ -5507,8 +3457,6 @@ function triNormalZ(w) {
 
   function decideBattleChange(sample) {
     if (!sample) return null;
-    // Never reset on a position jump, respawn, teleport, or frozen pos alone.
-    // Only a new physicsWorld identity means a different battle.
     if (sample.newerWorld && sample.newerWorld !== sample.world) return "physicsWorld";
     if (sample.world && sample.watchWorld && sample.world !== sample.watchWorld && !isRetiredWorld(sample.world)) return "physicsWorld";
     return null;
@@ -5523,7 +3471,6 @@ function triNormalZ(w) {
 
   function pickNewerWorld(old) {
     var i, w, list;
-    // Only worlds seen after the current one count as "newer".
     var from = old ? worldCandidates.indexOf(old) : -1;
     for (i = worldCandidates.length - 1; i > from; i--) {
       w = worldCandidates[i];
@@ -5638,8 +3585,6 @@ function triNormalZ(w) {
       bodyListUnrelated: unrelated,
       posFrozenMs: frozenMs
     };
-    // Our own tank body put us back into a world we had left: the switch was wrong.
-    // Drop the stale world instead of resetting the map again.
     if (world && battleWatch.worldRef && world !== battleWatch.worldRef && isRetiredWorld(world)) {
       retireWorld(battleWatch.worldRef);
       unretireWorld(world);
@@ -5655,8 +3600,6 @@ function triNormalZ(w) {
       triggerBattleChange(reason);
       return;
     }
-    // Position function returns nothing for a while (battle over, or we are dead):
-    // keep it, but let the broad scan look for a newer one meanwhile.
     if (isPosHooked() && !(pos && isFiniteNum(pos.x))) {
       if (!battleWatch.posNullSince) battleWatch.posNullSince = now;
       else if (now - battleWatch.posNullSince > 2500 && !battleWatch.posStale) {
@@ -5667,7 +3610,6 @@ function triNormalZ(w) {
       battleWatch.posNullSince = 0;
       battleWatch.posStale = false;
     }
-    // We are alive, but no body of the current world is anywhere near us.
     if (sig.length) battleWatch.bodiesWorld = world;
     if (world && pos && isFiniteNum(pos.x) && battle.inBattle && (sig.length || battleWatch.bodiesWorld === world) &&
         isLocalAlive() === true) {
@@ -5676,9 +3618,6 @@ function triNormalZ(w) {
         bp = bodyPos(wb[bi]);
         if (bp && Math.abs(bp.x - pos.x) + Math.abs(bp.y - pos.y) + Math.abs(bp.z - pos.z) < 800) nearOwn = true;
       }
-      // A battle can have several physics worlds, so this alone never resets
-      // anything (that made our tank vanish): it only starts a search. Our hull,
-      // once found, brings its world along and a real switch is detected as usual.
       if (!nearOwn) {
         if (!battleWatch.strayedSince) battleWatch.strayedSince = now;
         else if (now - battleWatch.strayedSince > 1500 && !battleWatch.strayed) {
@@ -5716,9 +3655,9 @@ function triNormalZ(w) {
   }
 
   function seedScanQueue(push) {
-    push(window.Launcher);
-    push(window._cmd);
-    push(window.tankiStreamApi);
+    push(window[GAME.globals.launcher]);
+    push(window[GAME.globals.commands]);
+    push(window[GAME.globals.stream]);
     try {
       var canvases = document.querySelectorAll("canvas");
       for (var i = 0; i < canvases.length; i++) push(canvases[i]);
@@ -5750,16 +3689,16 @@ function triNormalZ(w) {
   }
 
   function isGameBundleReady() {
-    try { if (window.Launcher) return true; } catch (e) {}
-    try { if (window.tankiStreamApi) return true; } catch (e2) {}
+    try { if (window[GAME.globals.launcher]) return true; } catch (e) {}
+    try { if (window[GAME.globals.stream]) return true; } catch (e2) {}
     try {
       var scripts = document.getElementsByTagName("script"), i, src;
       for (i = 0; i < scripts.length; i++) {
         src = scripts[i].src || "";
-        if ((/\/static\/js\/main[\w.\-]*\.js/.test(src) || /main\.[a-f0-9]+\.js/.test(src)) && window.Launcher) return true;
+        if ((/\/static\/js\/main[\w.\-]*\.js/.test(src) || /main\.[a-f0-9]+\.js/.test(src)) && window[GAME.globals.launcher]) return true;
       }
     } catch (e3) {}
-    try { if (document.querySelector("canvas") && window.Launcher) return true; } catch (e4) {}
+    try { if (document.querySelector("canvas") && window[GAME.globals.launcher]) return true; } catch (e4) {}
     return false;
   }
 
@@ -5799,7 +3738,7 @@ function triNormalZ(w) {
     while (queue.length && performance.now() - t0 < budgetMs && visited < 80000) {
       var obj = queue.shift();
       visited++;
-      if (shouldSkip(obj) && obj !== window.Launcher && obj !== window._cmd) {
+      if (shouldSkip(obj) && obj !== window[GAME.globals.launcher] && obj !== window[GAME.globals.commands]) {
         if (typeof obj === "function") recordCallable(obj);
         continue;
       }
@@ -5836,8 +3775,8 @@ function triNormalZ(w) {
         var vt = typeof val;
         if (vt === "function") {
           recordCallable(val);
-          if (!OFF.wrapPoint && val && (val.callableName === "initPoint" || val.callableName === "initNewStylePoint")) {
-            try { val = wrapPointInitFn(obj, name, val); hooks[val.callableName] = val; } catch (eCp) {}
+          if (!OFF.wrapPoint && val && isPointInitRole(CALLABLE_ROLES[val.callableName])) {
+            try { val = wrapPointInitFn(obj, name, val); hooks[CALLABLE_ROLES[val.callableName]] = val; } catch (eCp) {}
           }
         }
         if (vt === "object" || vt === "function") {
@@ -5875,87 +3814,10 @@ function triNormalZ(w) {
     if (!quiet) logDebug("scan #" + scanStats.runs + " visited=" + visited + " ms=" + scanStats.lastMs + " bodies=" + bodyCandidates.length + " mounts=" + mountCandidates.length + " queue=" + (scanCursor.queue ? scanCursor.queue.length : 0));
   }
 
-  /* ---------- overlay ---------- */
-
-  function ensureOverlay() {
-    if (overlay && overlay.isConnected) return overlay;
-    overlay = document.getElementById(OVERLAY_ID);
-    if (overlay) return overlay;
-    overlay = document.createElement("div");
-    overlay.id = OVERLAY_ID;
-    overlay.style.cssText = [
-      "position:fixed",
-      "top:8px",
-      "left:8px",
-      "z-index:2147483647",
-      "pointer-events:none",
-      "font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
-      "color:#d6ffd6",
-      "background:rgba(0,0,0,0.62)",
-      "padding:6px 8px",
-      "border-radius:4px",
-      "white-space:pre",
-      "text-shadow:0 1px 2px #000",
-      "user-select:none"
-    ].join(";");
-    (document.body || document.documentElement).appendChild(overlay);
-    return overlay;
-  }
-
   function fmt(n, digits) {
     if (n == null || !isFinite(n)) return "—";
     return Number(n).toFixed(digits);
   }
-
-  function formatRayLine(label, a) {
-    if (!a || a.type == null || a.dist == null) return label + ": —";
-    var dist = fmt(a.dist, 1) + " м";
-    if (a.name) return label + ": " + a.type + " (" + a.name + "), " + dist;
-    return label + ": " + a.type + ", " + dist;
-  }
-
-  function render(me, waiting) {
-    var el = ensureOverlay();
-    if (waiting) {
-      var sec = ((Date.now() - startedAt) / 1000) | 0;
-      setOverlayText(el, "toCoords: жду бой… (" + sec + "s)\nscan " + scanStats.runs + ", hooks: " + hookSummary());
-      return;
-    }
-    var htxt = me.headingDeg == null ? "—" : fmt(me.headingDeg, 1) + "°";
-    var vtxt = speedState.kmh == null ? "—" : fmt(speedState.kmh, 1) + " км/ч";
-    setOverlayText(el,
-      "x " + fmt(me.x, 2) + " м" +
-      "\ny " + fmt(me.y, 2) + " м" +
-      "\nz " + fmt(me.z, 2) + " м" +
-      "\nh " + htxt +
-      "\nv " + vtxt +
-      "\n" + formatRayLine("корпус", lastAhead && lastAhead.hull) +
-      "\n" + formatRayLine("дуло", lastAhead && lastAhead.barrel));
-  }
-
-  var lastOverlayText = null, lastOverlayAt = 0;
-  function setOverlayText(el, txt) {
-    var now = Date.now();
-    if (txt === lastOverlayText || now - lastOverlayAt < 100) return;
-    lastOverlayText = txt;
-    lastOverlayAt = now;
-    el.textContent = txt;
-  }
-
-  function hookSummary() {
-    var names = [];
-    if (hooks.getLocalTankPosition) names.push("pos");
-    if (hooks.isLocalTankAlive) names.push("alive");
-    if (hooks.showPositionLocalTank) names.push("cmd");
-    if (hooks.physicsBody) names.push("body");
-    if (hooks.physicsWorld) names.push("ray");
-    if (hooks.camera) names.push("cam");
-    if (mountCandidates.length) names.push("mount");
-    if (hooks.battleMap || mapCache.data) names.push("map");
-    return names.length ? names.join(",") : "нет";
-  }
-
-  var lastHeadingDebug = null;
 
   function computeMe(now) {
     var pos = readPositionFromHook();
@@ -5966,15 +3828,15 @@ function triNormalZ(w) {
     var heading = null;
     var headingSource = null;
     var q = hull && hull.quat ? hull.quat : null;
-    if (!q && body && body.v9i_1) {
-      q = parseQuaternion(body.v9i_1.g9j_1);
+    if (!q && body && body[G.bodyState]) {
+      q = parseQuaternion(body[G.bodyState][G.orientation]);
     }
     if (q) {
       lastQuat = q;
       heading = quatToHeading(q);
       if (heading != null) headingSource = "physicsQuat";
     }
-    var vel = hull && hull.vel ? hull.vel : (body && body.v9i_1 ? parseVector3(body.v9i_1.f9j_1) : null);
+    var vel = hull && hull.vel ? hull.vel : (body && body[G.bodyState] ? parseVector3(body[G.bodyState][G.velocity]) : null);
     var velH = headingFromVelocity(vel);
     if (heading == null && velH != null) {
       heading = velH;
@@ -6040,7 +3902,7 @@ function triNormalZ(w) {
     push(hooks.physicsWorld);
     push(hooks.physicsBody);
     push(hooks.battleMap);
-    try { if (hooks.physicsBody && hooks.physicsBody.b9i_1) push(hooks.physicsBody.b9i_1); } catch (e) {}
+    try { if (hooks.physicsBody && hooks.physicsBody[G.bodyOwner]) push(hooks.physicsBody[G.bodyOwner]); } catch (e) {}
     for (i = 0; i < bodyCandidates.length && i < 12; i++) push(bodyCandidates[i]);
     for (i = 0; i < mountCandidates.length && i < 12; i++) push(mountCandidates[i]);
     while (q.length && performance.now() - t0 < budgetMs && n < 2500) {
@@ -6083,11 +3945,6 @@ function triNormalZ(w) {
         lastBurstAt = now;
         logDebug("game bundle ready t=" + Math.round(now - startedAt) + "ms");
       } else {
-        render(null, true);
-        if (minimap.on && now >= nextMinimapAt) {
-          try { drawMinimap(); } catch (eEarly) {}
-          nextMinimapAt = now + 250;
-        }
         return;
       }
     }
@@ -6109,8 +3966,6 @@ function triNormalZ(w) {
     };
     if (posHooked && hasWorld) {
       burstFramesLeft = 0;
-      // Our own muzzle not found yet: keep a light background scan going (~5% of a frame budget),
-      // otherwise the map ray falls back to the camera/hull direction.
       var needMount = radarScanRuns < RADAR_SCAN_MAX_RUNS && !(lastMeEngine && dirFromLocalMount(lastMeEngine));
       var needRadar = !hooks.radarSystem && radarScanRuns < RADAR_SCAN_MAX_RUNS;
       var sinceEnter = Date.now() - (battle.enteredAt || 0);
@@ -6128,8 +3983,6 @@ function triNormalZ(w) {
         nextScanAt = now + 200;
       }
     } else if (shouldBroadScan(scanSample) && now >= nextScanAt) {
-      // Small slices every frame instead of 60-120 ms blocks: same search speed
-      // over a second, but no visible freezes while driving.
       var budget = lobby ? 15 : 8;
       if (burstFramesLeft > 0 && !lobby) {
         budget = 12;
@@ -6140,7 +3993,7 @@ function triNormalZ(w) {
       var delay;
       if (lobby) delay = 2000;
       else if (burstFramesLeft > 0 || (!posHooked && !battleWatch.posStale)) delay = 0;
-      else delay = 50; // also while the position hook only returns nothing (dead / lobby)
+      else delay = 50;
       nextScanAt = now + delay;
     }
 
@@ -6150,9 +4003,6 @@ function triNormalZ(w) {
         lastAhead = castAhead(engineMe, true);
         nextRayAt = now + RAY_INTERVAL_MS;
       }
-      render(lastMe, false);
-    } else {
-      render(null, true);
     }
     if (battle.inBattle || live) {
       try { updateFlagTakenStates(); } catch (eFl) {}
@@ -6160,8 +4010,6 @@ function triNormalZ(w) {
     if (hooks.physicsWorld || hooks.battleMap || battle.inBattle || live) {
       try { maybeStartMapCache(); } catch (eCache) {}
     }
-    // Flags, points, battle format and the follow camera hang off the battle
-    // world's controller Map: a short walk from there finds them quickly.
     var sinceIn = Date.now() - (battle.enteredAt || 0);
     if ((hooks.physicsWorld || hooks.radarSystem || mountCandidates.length) && now >= nextLiveWalkAt &&
         (sinceIn < 45000 || ((!battleParams || !followCam || !magnumAim) && sinceIn < 600000))) {
@@ -6176,7 +4024,200 @@ function triNormalZ(w) {
       try { applyParkourTrees(); } catch (eTr) {}
       nextTreesAt = now + 1000;
     }
-    minimapFrame(now);
+    publishToMapWindow(now);
+  }
+
+  var statusFlash = null;
+  function flash(text) {
+    statusFlash = { text: text, until: Date.now() + 1500 };
+  }
+  function statusText() {
+    if (statusFlash && Date.now() < statusFlash.until) return statusFlash.text;
+    if (nativeState.ready) return mapCache.status || "maps: tanki-ext/maps";
+    if (mapCache.needFolderClick) return "в консоли toCoords.pickMapFolder() или поставь native-host";
+    return mapCache.status || "жду бой";
+  }
+
+  function buildMapFrame() {
+    var now = Date.now(), local = localTeamName(), i, j, t, hd;
+    var me = lastMe && isFiniteNum(lastMe.x) ? {
+      x: lastMe.x, y: lastMe.y,
+      z: isFiniteNum(lastMe.z) ? lastMe.z : null,
+      heading: isFiniteNum(lastMe.heading) ? lastMe.heading : null
+    } : null;
+    var ray = null;
+    if (me) {
+      var barrel = lastRayDebug && lastRayDebug.barrel && lastRayDebug.barrel.forward;
+      ray = {
+        dx: barrel && isFiniteNum(barrel.x) ? barrel.x : null,
+        dy: barrel && isFiniteNum(barrel.y) ? barrel.y : null,
+        dist: lastAhead && lastAhead.barrel && isFiniteNum(lastAhead.barrel.dist) && lastAhead.barrel.dist > 0 ? lastAhead.barrel.dist : null
+      };
+    }
+
+    var flags = [], carried = [], dropped = [];
+    try { flags = flagLiveStates(); } catch (eF) { flags = []; }
+    for (i = 0; i < flags.length; i++) {
+      if (flags[i].state === GAME.flagStates.carried) carried.push(flags[i]);
+      else dropped.push({ x: flags[i].pos.x, y: flags[i].pos.y, side: sideOf(flags[i].team, flags[i].local || local) });
+    }
+
+    var markers = [], tanks = [];
+    try { markers = radarMarkers(); } catch (eR) { markers = []; }
+    for (i = 0; i < markers.length; i++) {
+      t = markers[i];
+      hd = radarHeading(t, now);
+      if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
+      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd });
+    }
+
+    var carriers = [], f, flagLocal, carrierTeam;
+    for (i = 0; i < carried.length; i++) {
+      f = carried[i];
+      flagLocal = f.local || local;
+      carrierTeam = f.team === GAME.teams.a || f.team === GAME.teams.b ? otherTeam(f.team) : "";
+      hd = radarHeading({ key: f.key, pos: f.pos }, now);
+      for (j = 0; !hd && j < markers.length; j++) {
+        if (Math.abs(markers[j].pos.x - f.pos.x) < 4 && Math.abs(markers[j].pos.y - f.pos.y) < 4) hd = radarHeading(markers[j], now);
+      }
+      carriers.push({ x: f.pos.x, y: f.pos.y, side: carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown", flagSide: sideOf(f.team, flagLocal), hd: hd });
+    }
+
+    var bases = [], point, pos, team;
+    for (i = 0; i < mapTeamPoints.length; i++) {
+      point = mapTeamPoints[i];
+      try {
+        if (!point || point[G.flagCarrierId] != null) continue;
+        pos = vecToM(parseMapVec(point[G.teamPointPosition]));
+        if (!pos) continue;
+        team = normalizeTeam(enumName(point[G.teamPointTeam]));
+        bases.push({
+          x: pos.x, y: pos.y,
+          side: team === GAME.teams.a || team === GAME.teams.b ? sideOf(team, local) : legacySide(team),
+          taken: !!flagTaken[team]
+        });
+      } catch (eTp) {}
+    }
+
+    var live = [], used = [], cps = [], cp, state;
+    try { live = cpLiveStates(); } catch (eC) { live = []; }
+    function liveAt(p) {
+      var k, d, best = -1, bestD = 9;
+      for (k = 0; k < live.length; k++) {
+        if (used[k]) continue;
+        d = (live[k].pos.x - p.x) * (live[k].pos.x - p.x) + (live[k].pos.y - p.y) * (live[k].pos.y - p.y);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      if (best < 0) return null;
+      used[best] = true;
+      return live[best];
+    }
+    function controlPoint(x, y, letter, s) {
+      if (!s) return { x: x, y: y, letter: letter || "?", live: false };
+      return {
+        x: x, y: y, letter: letter || s.letter || "?", live: true,
+        owner: s.owner ? sideOf(s.owner, s.local) : "neutral",
+        ring: s.capTeam ? sideOf(s.capTeam, s.local) : "neutral",
+        frac: Math.abs(s.score) / 100, active: s.active !== false
+      };
+    }
+    for (i = 0; i < mapControlPoints.length; i++) {
+      cp = mapControlPoints[i];
+      if (!cp || !cp.position) continue;
+      state = liveAt(cp.position);
+      cps.push(controlPoint(cp.position.x, cp.position.y, cp.letter && cp.letter !== "?" ? cp.letter : (state && state.letter), state));
+    }
+    for (i = 0; i < live.length; i++) if (!used[i]) cps.push(controlPoint(live[i].pos.x, live[i].pos.y, live[i].letter, live[i]));
+
+    var aim = null, aimState = null;
+    try { aimState = magnumAimState(); } catch (eA) { aimState = null; }
+    if (aimState) aim = { pts: aimState.pts.map(function (q) { return [q.x, q.y]; }), land: aimState.land ? [aimState.land.x, aimState.land.y] : null };
+
+    return {
+      me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim,
+      speedKmh: speedState.kmh,
+      status: statusText(),
+      parkour: { active: isParkour(), bushesHidden: bushesHidden }
+    };
+  }
+
+  var FRAME_INTERVAL_MS = 33;
+  var AUTO_OPEN_DELAY_MS = 3000;
+  var mapWindow = { connected: false, sentMapId: null, nextFrameAt: 0, openRequested: false };
+
+  function toBridge(kind, payload) {
+    var msg = payload || {};
+    msg.type = "TOC_OUT";
+    msg.kind = kind;
+    try { window.postMessage(msg, "*"); } catch (e) {}
+  }
+
+  function openMapWindow() {
+    mapWindow.openRequested = true;
+    toBridge("open");
+    return "окно карты открывается";
+  }
+
+  function sendMapToWindow() {
+    if (!mapCache.data || mapWindow.sentMapId === mapCache.id) return;
+    mapWindow.sentMapId = mapCache.id;
+    toBridge("map", { id: mapCache.id, data: mapCache.data, orientation: null });
+  }
+
+  function publishToMapWindow(now) {
+    if (!mapWindow.connected) {
+      if (battle.inBattle && !mapWindow.openRequested && now - pageStartedAt > AUTO_OPEN_DELAY_MS) openMapWindow();
+      return;
+    }
+    sendMapToWindow();
+    if (now < mapWindow.nextFrameAt) return;
+    mapWindow.nextFrameAt = now + FRAME_INTERVAL_MS;
+    toBridge("frame", { frame: buildMapFrame() });
+  }
+
+  function stepParkourCamera(factor) {
+    if (OFF.camera) return flash("камера: выключена (toCoords.off)");
+    if (!isParkour()) {
+      return flash(parkourKnown() ? "камера: только в паркуре (формат боя: " + battleFormatName() + ")" : "камера: ищу формат боя…");
+    }
+    if (!followCam) return flash("камера: ещё ищу…");
+    bumpParkourCam(factor);
+  }
+
+  function runCommand(command) {
+    if (command.name === "camera") stepParkourCamera(Number(command.factor) || 1);
+    else if (command.name === "bushes") setBushesHidden(!!command.hide);
+  }
+
+  function onBridgeMessage(event) {
+    if (event.source !== window) return;
+    var msg = event.data;
+    if (!msg || msg.type !== "TOC_IN") return;
+    if (msg.kind === "connected") {
+      mapWindow.connected = true;
+      mapWindow.openRequested = true;
+      mapWindow.sentMapId = null;
+      logDebug("map window connected");
+    } else if (msg.kind === "disconnected") {
+      mapWindow.connected = false;
+      logDebug("map window closed");
+    } else if (msg.kind === "command") {
+      runCommand(msg.command || {});
+    }
+  }
+
+  function onKeyDown(ev) {
+    if (!ev || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    var target = ev.target;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    var plus = ev.code === "Equal" || ev.code === "NumpadAdd";
+    var minus = ev.code === "Minus" || ev.code === "NumpadSubtract";
+    if ((plus || minus) && ev.shiftKey) stepParkourCamera(plus ? 1.15 : 1 / 1.15);
+    else if ((plus || minus) && mapWindow.connected) toBridge("zoom", { factor: plus ? 1.25 : 0.8 });
+    else if (ev.code === "KeyM" && !ev.shiftKey) openMapWindow();
+    else return;
+    ev.preventDefault();
+    ev.stopPropagation();
   }
 
   function status() {
@@ -6185,14 +4226,14 @@ function triNormalZ(w) {
       inBattle: !!battle.inBattle,
       battleId: battle.id,
       nativeMaps: nativeState.ready,
-      drive: !!minimap.drive,
+      mapWindow: mapWindow.connected,
       localAlive: isLocalAlive(),
       off: offList(),
       unitToMeter: UNIT,
       hooks: {
-        getLocalTankPosition: !!hooks.getLocalTankPosition,
-        isLocalTankAlive: !!hooks.isLocalTankAlive,
-        showPositionLocalTank: !!hooks.showPositionLocalTank,
+        localTankPosition: !!hooks.localTankPosition,
+        localTankAlive: !!hooks.localTankAlive,
+        printLocalTankPosition: !!hooks.printLocalTankPosition,
         physicsBody: !!hooks.physicsBody,
         physicsWorld: !!hooks.physicsWorld,
         radar: !!hooks.radarSystem,
@@ -6201,7 +4242,7 @@ function triNormalZ(w) {
         flagBases: mapTeamPoints.length,
         flagLive: flagLive.length,
         parkour: isParkour(),
-        battleFormat: battlefieldCC ? String(battlefieldCC.bic_1) : null,
+        battleFormat: battlefieldCC ? String(battlefieldCC[G.formatName]) : null,
         followCam: !!followCam,
         parkourCam: parkourCam.mult,
         magnumAim: !!magnumAim,
@@ -6210,20 +4251,19 @@ function triNormalZ(w) {
         radarMarkers: (function () { try { return radarMarkers().length; } catch (e) { return 0; } })(),
         radarRange: (function () {
           try {
-            var pr = hooks.radarSystem && hooks.radarSystem.j11x_1;
-            if (!pr || !isFiniteNum(pr.dje_1)) return null;
-            return { enterM: Math.round(toM(pr.dje_1) * 10) / 10, exitM: isFiniteNum(pr.eje_1) ? Math.round(toM(pr.eje_1) * 10) / 10 : null };
+            var pr = hooks.radarSystem && hooks.radarSystem[G.radarParams];
+            if (!pr || !isFiniteNum(pr[G.radarEnterRange])) return null;
+            return { enterM: Math.round(toM(pr[G.radarEnterRange]) * 10) / 10, exitM: isFiniteNum(pr[G.radarExitRange]) ? Math.round(toM(pr[G.radarExitRange]) * 10) / 10 : null };
           } catch (e) { return null; }
         })(),
         camera: !!hooks.camera,
         battleMap: !!hooks.battleMap,
         mapName: hooks.mapName || null,
-        hasB9m: (typeof worldHasFn === "function") ? worldHasFn("b9m") : false,
+        hasStaticRaycast: worldHasFn(G.staticRaycast),
         bodyCandidates: bodyCandidates.length,
         mountCandidates: mountCandidates.length,
         getEventListeners: typeof getEventListeners === "function"
       },
-      hookSummary: hookSummary(),
       source: lastMe && lastMe.source,
       headingSource: lastHeadingSource,
       barrelSource: lastBarrelSource,
@@ -6231,7 +4271,7 @@ function triNormalZ(w) {
       ahead: lastAhead,
       rayError: lastRayError,
       scan: scanStats,
-      interestingFound: Object.keys(foundCallables).filter(function (k) { return INTERESTING[k]; }),
+      callablesFound: Object.keys(foundCallables).filter(function (k) { return CALLABLE_ROLES[k]; }),
       debugLog: debugLog.slice()
     };
   }
@@ -6251,14 +4291,8 @@ function triNormalZ(w) {
     running = false;
     if (rafId) cancelAnimationFrame(rafId);
     rafId = 0;
-    var el = document.getElementById(OVERLAY_ID);
-    if (el && el.parentNode) el.parentNode.removeChild(el);
-    overlay = null;
-    var mm = document.getElementById(MINIMAP_ID);
-    if (mm && mm.parentNode) mm.parentNode.removeChild(mm);
-    minimap.wrap = null;
-    minimap.canvas = null;
-    try { document.removeEventListener("keydown", onMinimapHotkey, true); } catch (eKey) {}
+    try { document.removeEventListener("keydown", onKeyDown, true); } catch (eKey) {}
+    try { window.removeEventListener("message", onBridgeMessage); } catch (eMsg) {}
     logDebug("stopped");
     return "stopped";
   }
@@ -6298,8 +4332,7 @@ function triNormalZ(w) {
       return status();
     },
     exportMap: exportMap,
-    mapDebug: mapDebug,
-    minimap: minimapApi,
+    openMap: openMapWindow,
     pickMapFolder: pickMapFolder,
     grantMapFolder: grantMapFolder,
     loadMapFile: loadMapFile,
@@ -6312,9 +4345,6 @@ function triNormalZ(w) {
       }
       return engineRaysOn;
     },
-    // toCoords.off()                 -> list what is switched off now
-    // toCoords.off("cn,listeners")   -> switch those off after a page reload
-    // toCoords.off("all") / off("")  -> everything off / everything back on
     off: function (list) {
       if (typeof list === "string") {
         var want = list.split(/[\s,]+/).filter(function (k) { return k === "all" || OFF_KEYS.indexOf(k) >= 0; });
@@ -6325,14 +4355,13 @@ function triNormalZ(w) {
       }
       return { now: offList(), keys: OFF_KEYS.slice() };
     },
-    // parkour camera: what the script sees and what the camera currently uses
     camDebug: function () {
       var c = followCam, out = {
         parkour: isParkour(),
-        battleFormat: battlefieldCC ? String(battlefieldCC.bic_1) : null,
-        parkourFlag: battlefieldCC ? battlefieldCC.hic_1 : null,
-        sources: { battleData: !!battlefieldCC, battleParams: !!battleParams, mapComponent: mapComp ? mapComp.m102_1 : null },
-        treesHidden: treesHidden.filter(function (t) { try { return !t.o.m3k(); } catch (e) { return false; } }).length,
+        battleFormat: battlefieldCC ? String(battlefieldCC[G.formatName]) : null,
+        parkourFlag: battlefieldCC ? battlefieldCC[G.parkourMode] : null,
+        sources: { battleData: !!battlefieldCC, battleParams: !!battleParams, mapComponent: mapComp ? mapComp[G.parkourGeometry] : null },
+        treesHidden: treesHidden.filter(function (t) { try { return !t.o[G.isVisible](); } catch (e) { return false; } }).length,
         searching: !parkourKnown(),
         cameras: followCams.length,
         ours: !!c,
@@ -6341,28 +4370,25 @@ function triNormalZ(w) {
       };
       try {
         if (c) {
-          out.distance = Math.round(c.uzs_1.uzu_1);
-          out.height = Math.round(c.uzs_1.vzu_1);
-          out.key0 = { d: Math.round(c.tzs_1.wzu_1.uzu_1), h: Math.round(c.tzs_1.wzu_1.vzu_1) };
-          out.azv = c.tzs_1.azv_1;
-          out.path = Math.round(c.qzs_1 * 1000) / 1000;
+          out.distance = Math.round(c[G.cameraOffset][G.keyDistance]);
+          out.height = Math.round(c[G.cameraOffset][G.keyHeight]);
+          out.key0 = { d: Math.round(c[G.cameraSpline][G.splineKey0][G.keyDistance]), h: Math.round(c[G.cameraSpline][G.splineKey0][G.keyHeight]) };
+          out.azv = c[G.cameraSpline][G.splineScale];
+          out.path = Math.round(c[G.cameraPath] * 1000) / 1000;
         }
       } catch (e) { out.error = String(e && e.message || e); }
       return out;
     },
-    // Magnum aim as the game shows it right now (null when not aiming)
     aimDebug: function () {
       var st = magnumAimState();
       if (!st) return { found: !!magnumAim, showing: false };
       return { found: true, showing: true, points: st.pts.length, land: st.land ? { x: Math.round(st.land.x * 10) / 10, y: Math.round(st.land.y * 10) / 10 } : null };
     },
-    // CTF flags the game is showing a marker for right now (carried / dropped)
     flagDebug: function () {
       return flagLiveStates().map(function (f) {
         return { state: f.state, team: f.team, ourTeam: f.local, x: Math.round(f.pos.x), y: Math.round(f.pos.y) };
       });
     },
-    // live control points: owner, score (-100..100), who is capturing, our team
     cpDebug: function () {
       return cpLiveStates().map(function (c) {
         return { letter: c.letter, owner: c.owner || "NEUTRAL", score: Math.round(c.score), capturing: c.capTeam, ourTeam: c.local, active: c.active };
@@ -6371,14 +4397,14 @@ function triNormalZ(w) {
     radarDebug: function () {
       var sys = hooks.radarSystem;
       if (!sys) return { radar: false };
-      return iterList(sys.n11x_1).slice(0, 12).map(function (e) {
-        var m = e && e.u11x_1, spr = m && m.q11w_1, nums = {}, k;
+      return iterList(sys[G.radarEntries]).slice(0, 12).map(function (e) {
+        var m = e && e[G.entryMarker], spr = m && m[G.markerSprite], nums = {}, k;
         try {
           for (k in spr) {
             if (typeof spr[k] === "number" || typeof spr[k] === "string" || typeof spr[k] === "boolean") nums[k] = spr[k];
           }
         } catch (eK) {}
-        var col = spr && spr.d4q_1, colFields = null;
+        var col = spr && spr[G.spriteTint], colFields = null;
         if (col && typeof col === "object") {
           colFields = {};
           try { Object.keys(col).forEach(function (ck) { var cv = col[ck]; if (typeof cv !== "object" && typeof cv !== "function") colFields[ck] = cv; }); } catch (eCF) {}
@@ -6395,12 +4421,8 @@ function triNormalZ(w) {
   function boot() {
     if (boot.done) return;
     boot.done = true;
-    ensureOverlay();
-    render(null, true);
-    if (minimap.on) {
-      try { ensureMinimap(); } catch (eMin) {}
-    }
-    try { document.addEventListener("keydown", onMinimapHotkey, true); } catch (eKey) {}
+    try { document.addEventListener("keydown", onKeyDown, true); } catch (eKey) {}
+    window.addEventListener("message", onBridgeMessage);
     rafId = requestAnimationFrame(tick);
     function startScan(reason) {
       gameReady = isGameBundleReady() || reason === "timeout";
@@ -6412,10 +4434,10 @@ function triNormalZ(w) {
         burstFramesLeft = 0;
         nextScanAt = (typeof performance !== "undefined" ? performance.now() : Date.now()) + 2000;
       }
-      console.log("[toCoords] запущен. toCoords.me() / speed() / ahead() / exportMap() / minimap() / pickMapFolder() / loadMapFile() / saveMap() / headingDebug() / mapDebug() / rayDebug() / status() / stop()");
+      console.log("[toCoords] запущен. Карта — в отдельном окне (M). toCoords.status() / openMap() / me() / off()");
     }
     installNativeListener();
-    pingNative().then(function () { try { updateMinimapChrome(); } catch (eN) {} });
+    pingNative();
     if (isGameBundleReady()) startScan("ready");
     else waitForGameBundle(startScan);
   }

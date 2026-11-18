@@ -414,4 +414,4 @@ EOF
 | карта | `"BattleMap ["`, `"CollisionGeometry ["` |
 | векторы | `"Vector3 ("`, `"Quaternion("` |
 
-Когда найдёшь класс, выпиши поля из его конструктора: `function Имя(){…this.поле_1=…}`. Методы — из `Zy(Имя).метод=function`. Обнови эту заметку и проверки полей в `scripts/tanki-self-coords.js`: функции `looksLike…`, `remember…`, `radarMarkers`, `cpLiveStates`.
+Когда найдёшь класс, выпиши поля из его конструктора: `function Имя(){…this.поле_1=…}`. Методы — из `Zy(Имя).метод=function`. Новые имена вписываются только в таблицу `src/page/game-adapter.js` — остальной код обращается к игре через неё.
