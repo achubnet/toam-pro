@@ -2,11 +2,25 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <title>TO Coords — карта</title>
-  <link rel="stylesheet" href="map.css">
+  <title>TO Coords</title>
+  <link rel="stylesheet" href="window.css">
 </head>
 <body>
-  <canvas id="map"></canvas>
+  <nav id="tabs">
+    <button data-tab="map">Карта</button>
+    <button data-tab="chat">Чат <span class="badge" data-badge="chat"></span></button>
+    <button data-tab="players">Игроки</button>
+    <button data-tab="kills">Убийства <span class="badge" data-badge="kills"></span></button>
+  </nav>
+  <main>
+    <section class="tab" data-tab="map">
+      <canvas id="map"></canvas>
+      <div id="tank-info" hidden></div>
+    </section>
+    <section class="tab list" data-tab="chat"><ol id="chat"></ol></section>
+    <section class="tab list" data-tab="players"><div id="players"></div></section>
+    <section class="tab list" data-tab="kills"><ol id="kills"></ol></section>
+  </main>
   <footer id="panel">
     <div class="group">
       <span class="label">Карта</span>
@@ -20,6 +34,7 @@
     </div>
     <label class="switch"><input type="checkbox" data-switch="bushes" data-parkour-only><span>Скрыть кусты</span></label>
     <label class="switch"><input type="checkbox" data-switch="health"><span>Здоровье</span></label>
+    <label class="switch"><input type="checkbox" data-switch="tank"><span>Танк</span></label>
     <label class="switch" title="Клавиши из этого окна идут в игру"><input type="checkbox" data-switch="control"><span>Управление</span></label>
     <div id="info"></div>
     <div id="status"></div>
@@ -27,6 +42,10 @@
   <script src="../shared/map-geometry.js"></script>
   <script src="map-layers.js"></script>
   <script src="map-renderer.js"></script>
-  <script src="map.js"></script>
+  <script src="tank-view.js"></script>
+  <script src="chat-view.js"></script>
+  <script src="players-view.js"></script>
+  <script src="kills-view.js"></script>
+  <script src="window.js"></script>
 </body>
 </html>

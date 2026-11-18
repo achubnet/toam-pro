@@ -9,11 +9,19 @@
   var info = document.getElementById("info");
   var statusLine = document.getElementById("status");
   var parkourControls = document.querySelectorAll("[data-parkour-only]");
+  var tankInfo = document.getElementById("tank-info");
+  var lists = {
+    chat: document.getElementById("chat"),
+    players: document.getElementById("players"),
+    kills: document.getElementById("kills")
+  };
   var switches = {
     bushes: document.querySelector('[data-switch="bushes"]'),
     health: document.querySelector('[data-switch="health"]'),
+    tank: document.querySelector('[data-switch="tank"]'),
     control: document.querySelector('[data-switch="control"]')
   };
+  var unread = { chat: 0, kills: 0 };
 
   var renderer = TOC.renderer.create();
   var view = loadView();
@@ -24,20 +32,44 @@
   var heldKeys = {};
 
   function loadView() {
-    var v = { zoom: 2, follow: true, drive: false, health: false, control: false };
+    var v = { zoom: 2, follow: true, drive: false, health: false, tank: false, control: false, tab: "map" };
     try {
       var saved = JSON.parse(localStorage.getItem("toc.view") || "null") || {};
       if (saved.zoom > 0) v.zoom = saved.zoom;
       v.health = !!saved.health;
+      v.tank = !!saved.tank;
       v.control = !!saved.control;
+      if (saved.tab) v.tab = saved.tab;
     } catch (e) {}
     return v;
   }
 
   function saveView() {
     try {
-      localStorage.setItem("toc.view", JSON.stringify({ zoom: view.zoom, health: view.health, control: view.control }));
+      localStorage.setItem("toc.view", JSON.stringify({
+        zoom: view.zoom, health: view.health, tank: view.tank, control: view.control, tab: view.tab
+      }));
     } catch (e) {}
+  }
+
+  function showTab(name) {
+    if (!document.querySelector('section[data-tab="' + name + '"]')) name = "map";
+    view.tab = name;
+    saveView();
+    var all = document.querySelectorAll("[data-tab]");
+    for (var i = 0; i < all.length; i++) all[i].classList.toggle("active", all[i].getAttribute("data-tab") === name);
+    if (unread[name] != null) setUnread(name, 0);
+    dirty = true;
+  }
+
+  function setUnread(name, count) {
+    unread[name] = count;
+    var badge = document.querySelector('[data-badge="' + name + '"]');
+    if (badge) badge.textContent = count ? String(count) : "";
+  }
+
+  function noteNew(name, added) {
+    if (added && view.tab !== name) setUnread(name, unread[name] + added);
   }
 
   function zoomBy(factor) {
@@ -78,6 +110,18 @@
       frame = msg.frame;
       dirty = true;
       updatePanel();
+      if (view.tank) TOC.views.tank.render(tankInfo, frame);
+    } else if (msg.kind === "battle") {
+      TOC.views.chat.clear(lists.chat);
+      TOC.views.kills.clear(lists.kills);
+      setUnread("chat", 0);
+      setUnread("kills", 0);
+    } else if (msg.kind === "chat") {
+      noteNew("chat", TOC.views.chat.render(lists.chat, msg.messages));
+    } else if (msg.kind === "kills") {
+      noteNew("kills", TOC.views.kills.render(lists.kills, msg.kills));
+    } else if (msg.kind === "players") {
+      TOC.views.players.render(lists.players, msg.teams);
     } else if (msg.kind === "zoom") {
       zoomBy(msg.factor);
     } else if (msg.kind === "replaced") {
@@ -111,8 +155,11 @@
     statusLine.textContent = (frame && frame.status) || "";
   }
 
-  function applyControl() {
+  function applySwitches() {
     switches.health.checked = view.health;
+    switches.tank.checked = view.tank;
+    tankInfo.hidden = !view.tank;
+    if (view.tank) TOC.views.tank.render(tankInfo, frame);
     switches.control.checked = view.control;
     document.body.classList.toggle("control", view.control);
     if (!view.control) releaseKeys();
@@ -134,10 +181,19 @@
     saveView();
     dirty = true;
   });
+  switches.tank.addEventListener("change", function () {
+    view.tank = switches.tank.checked;
+    saveView();
+    applySwitches();
+  });
+  document.getElementById("tabs").addEventListener("click", function (e) {
+    var tab = e.target.closest("[data-tab]");
+    if (tab) showTab(tab.getAttribute("data-tab"));
+  });
   switches.control.addEventListener("change", function () {
     view.control = switches.control.checked;
     saveView();
-    applyControl();
+    applySwitches();
   });
 
   function keyCommand(type, e) {
@@ -176,6 +232,7 @@
 
   function fitCanvas() {
     var w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
     if (canvas.width === w && canvas.height === h) return;
     canvas.width = w;
     canvas.height = h;
@@ -184,13 +241,16 @@
 
   function loop() {
     requestAnimationFrame(loop);
+    if (view.tab !== "map") return;
     fitCanvas();
     if (!dirty) return;
     dirty = false;
     renderer.draw(canvas, frame, view);
   }
 
-  applyControl();
+  showTab(view.tab);
+  TOC.views.players.render(lists.players, []);
+  applySwitches();
   updatePanel();
   connect();
   loop();

@@ -2595,7 +2595,27 @@
       return { pts: pts, land: land };
     } catch (e) { return null; }
   }
+  var uiStore = null;
+  function isUiStore(o) {
+    try {
+      return !!o && typeof o[G.storeReducer] === "function" && typeof o[G.storeDispatch] === "function" &&
+        !!o[G.storeState] && !!o[G.storeState][G.battleChat] && G.chatMessages in o[G.storeState][G.battleChat];
+    } catch (e) { return false; }
+  }
+  function rememberUiStore(obj) {
+    if (uiStore || !obj) return;
+    var watched = null;
+    try { watched = obj[G.storeWatcher] && obj[G.storeWatcher][G.watchedStore]; } catch (e) {}
+    if (isUiStore(watched)) uiStore = watched;
+    else if (isUiStore(obj)) uiStore = obj;
+    if (uiStore) logDebug("ui store found");
+  }
+  function uiState() {
+    try { return uiStore && uiStore[G.storeState]; } catch (e) { return null; }
+  }
+
   function rememberLiveObjects(obj) {
+    rememberUiStore(obj);
     rememberCpRuntime(obj);
     rememberFlagObj(obj);
     rememberBattleParams(obj);
@@ -4013,7 +4033,7 @@
     }
     var sinceIn = Date.now() - (battle.enteredAt || 0);
     if ((hooks.physicsWorld || hooks.radarSystem || mountCandidates.length) && now >= nextLiveWalkAt &&
-        (sinceIn < 45000 || ((!battleParams || !followCam || !magnumAim) && sinceIn < 600000))) {
+        (sinceIn < 45000 || ((!battleParams || !followCam || !magnumAim || !uiStore) && sinceIn < 600000))) {
       try { walkBattleWorld(battleWorld(), 4); } catch (eLw) {}
       nextLiveWalkAt = now + 1000;
     }
@@ -4044,17 +4064,18 @@
       isFiniteNum(c[G.healthCurrent]) && isFiniteNum(c[G.healthMax]) && c[G.healthMax] > 0;
   }
 
-  function entityHealth(entity) {
-    var components, found = null;
-    try { components = entity && entity[G.entityComponents] && entity[G.entityComponents][G.jsMap]; } catch (e) { return null; }
-    if (!components || typeof components.forEach !== "function") return null;
-    components.forEach(function (list) {
-      if (found || !list) return;
-      try {
-        var first = list[G.size]() > 0 ? list[G.get](0) : null;
-        if (isHealthComponent(first)) found = first;
-      } catch (e) {}
+  function entityComponents(entity) {
+    var map, out = [];
+    try { map = entity && entity[G.entityComponents] && entity[G.entityComponents][G.jsMap]; } catch (e) { return out; }
+    if (!map || typeof map.forEach !== "function") return out;
+    map.forEach(function (list) {
+      try { if (list && list[G.size]() > 0) out.push(list[G.get](0)); } catch (e) {}
     });
+    return out;
+  }
+
+  function entityHealth(entity) {
+    var found = entityComponents(entity).filter(isHealthComponent)[0];
     return found ? { now: Math.max(0, Math.round(found[G.healthCurrent])), max: Math.round(found[G.healthMax]) } : null;
   }
 
@@ -4174,7 +4195,8 @@
       me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim,
       speedKmh: speedState.kmh,
       status: statusText(),
-      parkour: { active: isParkour(), bushesHidden: bushesHidden }
+      parkour: { active: isParkour(), bushesHidden: bushesHidden },
+      tank: (function () { try { return tankInfo(now); } catch (e) { return null; } })()
     };
   }
 
@@ -4207,9 +4229,283 @@
       return;
     }
     sendMapToWindow();
+    publishBattleInfo(now);
     if (now < mapWindow.nextFrameAt) return;
     mapWindow.nextFrameAt = now + FRAME_INTERVAL_MS;
     toBridge("frame", { frame: buildMapFrame() });
+  }
+
+  var DEG = 180 / Math.PI;
+
+  function kotlinMapEach(map, fn) {
+    if (!map || typeof map[G.mapEntries] !== "function") return;
+    var it = map[G.mapEntries]()[G.iterator](), entry, n = 0;
+    while (it[G.hasNext]() && n++ < 1000) {
+      entry = it[G.next]();
+      fn(entry[G.entryKey](), entry[G.entryValue]());
+    }
+  }
+
+  function kotlinMapGet(map, key) {
+    try { return map && typeof map[G.mapGet] === "function" ? map[G.mapGet](key) : null; } catch (e) { return null; }
+  }
+
+  function numberOrNull(v) {
+    return typeof v === "number" && isFinite(v) ? v : null;
+  }
+
+  function ownUserKey(state) {
+    try { return String(state[G.session][G.ownUserId]); } catch (e) { return null; }
+  }
+
+  function equipmentNames(tank) {
+    if (!tank) return { hull: null, turret: null };
+    var hullId = tank[G.hullBaseId], turretId = tank[G.turretBaseId];
+    return {
+      hull: hullId == null ? null : (TOC.catalog.hulls[String(hullId)] || null),
+      turret: turretId == null ? null : (TOC.catalog.turrets[String(turretId)] || null)
+    };
+  }
+
+  var TEAM_TITLES = { ally: "Союзники", enemy: "Противники", red: "Красные", blue: "Синие", all: "Игроки" };
+
+  function playerTeams() {
+    var state = uiState(), users = state && state[G.battleUsers];
+    if (!users) return [];
+    var me = ownUserKey(state), online = users[G.onlineUsers], rows = [], myTeam = null;
+    kotlinMapEach(users[G.userNames], function (key, name) {
+      if (online && typeof online[G.setContains] === "function" && !online[G.setContains](key)) return;
+      var stat = kotlinMapGet(users[G.userStats], key) || {};
+      var kit = equipmentNames(kotlinMapGet(users[G.userTanks], key));
+      var row = {
+        name: String(name), rank: numberOrNull(kotlinMapGet(users[G.userRanks], key)),
+        score: numberOrNull(stat[G.statScore]), kills: numberOrNull(stat[G.statKills]), deaths: numberOrNull(stat[G.statDeaths]),
+        turret: kit.turret, hull: kit.hull, me: String(key) === me,
+        team: enumStr(kotlinMapGet(users[G.userTeams], key))
+      };
+      if (row.me) myTeam = row.team;
+      rows.push(row);
+    });
+    rows.sort(function (a, b) { return (b.score || 0) - (a.score || 0) || (b.kills || 0) - (a.kills || 0) || (a.deaths || 0) - (b.deaths || 0); });
+    var groups = {}, order = [];
+    rows.forEach(function (row) {
+      var side = row.team === GAME.teams.a || row.team === GAME.teams.b ? sideOf(row.team, myTeam) : "all";
+      if (!groups[side]) { groups[side] = { side: side, name: TEAM_TITLES[side] || side, players: [] }; order.push(side); }
+      delete row.team;
+      groups[side].players.push(row);
+    });
+    order.sort(function (a, b) { return (a === "ally" ? -1 : 0) - (b === "ally" ? -1 : 0); });
+    return order.map(function (side) { return groups[side]; });
+  }
+
+  function labelPlayer(label, me) {
+    if (!label) return null;
+    var relation = enumStr(label[G.labelRelation]);
+    return {
+      name: String(label[G.labelName]),
+      side: relation === GAME.relations.ally ? "ally" : (relation === GAME.relations.enemy ? "enemy" : null),
+      me: me != null && String(label[G.labelUserId]) === me
+    };
+  }
+
+  var KILL_LOG_MAX = 200;
+  var kills = { seen: typeof WeakSet === "function" ? new WeakSet() : null, log: [], nextId: 1, battleId: undefined };
+
+  function killEntry(item, me) {
+    if (G.killerLabel in item) {
+      var type = enumStr(item[G.damageType]);
+      return {
+        id: kills.nextId++, time: Date.now(),
+        killer: labelPlayer(item[G.killerLabel], me), victim: labelPlayer(item[G.victimLabel], me),
+        weapon: TOC.catalog.damage[type] || type.toLowerCase() || null
+      };
+    }
+    if (G.actorLabel in item && enumStr(item[G.actionType]) === GAME.actionTypes.suicide) {
+      return { id: kills.nextId++, time: Date.now(), killer: null, victim: labelPlayer(item[G.actorLabel], me) };
+    }
+    return null;
+  }
+
+  function killFeed() {
+    if (kills.battleId !== battle.id) {
+      kills.battleId = battle.id;
+      kills.log = [];
+    }
+    var state = uiState(), log = state && state[G.actionsLog];
+    var items = log ? iterList(log[G.logEntries]) : [], me = state ? ownUserKey(state) : null, i, item, entry;
+    for (i = 0; i < items.length; i++) {
+      item = items[i];
+      if (!item || typeof item !== "object" || !kills.seen || kills.seen.has(item)) continue;
+      kills.seen.add(item);
+      entry = killEntry(item, me);
+      if (entry) kills.log.push(entry);
+    }
+    if (kills.log.length > KILL_LOG_MAX) kills.log.splice(0, kills.log.length - KILL_LOG_MAX);
+    return kills.log;
+  }
+
+  function localTankEntity() {
+    var world = battleWorld(), list = null;
+    try { list = world && world[G.entityTags] && world[G.entityTags][G.jsMap].get(GAME.entityTags.localTank); } catch (e) {}
+    try { if (list && list[G.size]() > 0) return list[G.get](0); } catch (e2) {}
+    return ownEntity();
+  }
+
+  function isNum(o, key) { return typeof o[key] === "number"; }
+
+  var TANK_PARTS = {
+    mount: function (c) { return isNum(c, G.turretAngle) && isNum(c, G.elevationAngle) && !!c[G.mountMatrix] && Array.isArray(c[G.mountSockets]); },
+    turret: function (c) { return isNum(c, G.turretSpeedNow) && isNum(c, G.turretSpeedMax) && G.turretController in c; },
+    barrel: function (c) { return isNum(c, G.elevationSpeedNow) && isNum(c, G.elevationSpeedMax) && G.barrelMount in c; },
+    reloadStatus: function (c) { return typeof c[G.reloadProgress] === "function"; },
+    reloadTimer: function (c) { return isNum(c, G.reloadTime) && isNum(c, G.reloadReadyAt) && typeof c[G.reloadStunned] === "boolean"; },
+    salvo: function (c) { return isNum(c, G.salvoReloadTime) && isNum(c, G.salvoEndsAt); },
+    magnum: function (c) { return isNum(c, G.magnumReloadTime) && G.magnumCharge in c; },
+    idle: function (c) { return isNum(c, G.idlePeriod) && isNum(c, G.idleElapsed) && isNum(c, G.idleWarnAt) && typeof c[G.idlePaused] === "boolean"; },
+    weapon: function (c) { return G.weaponKind in c; }
+  };
+
+  var tankParts = { entity: null, parts: null, at: 0 };
+
+  function localTankParts(now) {
+    var entity = localTankEntity();
+    if (!entity) return null;
+    if (tankParts.entity === entity && now - tankParts.at < 1000) return tankParts.parts;
+    var parts = {}, comps = entityComponents(entity), i, key, c;
+    for (i = 0; i < comps.length; i++) {
+      c = comps[i];
+      if (!c || typeof c !== "object") continue;
+      for (key in TANK_PARTS) {
+        if (parts[key]) continue;
+        try { if (TANK_PARTS[key](c)) parts[key] = c; } catch (e) {}
+      }
+    }
+    tankParts = { entity: entity, parts: parts, at: now };
+    return parts;
+  }
+
+  function reloadState(p) {
+    if (!p.reloadStatus) return null;
+    var progress = null;
+    try { progress = numberOrNull(p.reloadStatus[G.reloadProgress]()); } catch (e) {}
+    if (progress == null) return null;
+    progress = Math.max(0, Math.min(1, progress));
+    var total = p.reloadTimer ? p.reloadTimer[G.reloadTime] : (p.salvo ? p.salvo[G.salvoReloadTime] : (p.magnum ? p.magnum[G.magnumReloadTime] : null));
+    total = numberOrNull(total);
+    if (!total || total <= 0) return { frac: progress };
+    return { left: (1 - progress) * total, total: total };
+  }
+
+  function ownKit() {
+    var state = uiState(), users = state && state[G.battleUsers], me = state && state[G.session] && state[G.session][G.ownUserId];
+    if (!users || me == null) return { hull: null, turret: null };
+    return equipmentNames(kotlinMapGet(users[G.userTanks], me));
+  }
+
+  function tankInfo(now) {
+    var info = { mapName: hooks.mapName || null }, p = localTankParts(now);
+    var kit = ownKit();
+    info.hull = kit.hull;
+    info.turret = kit.turret;
+    if (!p) return info;
+    if (!info.turret && p.weapon) {
+      var kind = enumStr(p.weapon[G.weaponKind]);
+      info.turret = TOC.catalog.weaponKinds[kind] || kind || null;
+    }
+    if (p.turret && p.mount) {
+      info.turretDeg = -p.mount[G.turretAngle] * DEG;
+      info.turretSpeed = { now: Math.abs(p.turret[G.turretSpeedNow]) * DEG, max: p.turret[G.turretSpeedMax] * DEG };
+    }
+    if (p.barrel && p.mount) {
+      info.elevationDeg = p.mount[G.elevationAngle] * DEG;
+      info.elevationSpeed = { now: Math.abs(p.barrel[G.elevationSpeedNow]) * DEG, max: p.barrel[G.elevationSpeedMax] * DEG };
+    }
+    info.reload = reloadState(p);
+    if (p.idle) info.idleKick = Math.max(0, p.idle[G.idlePeriod] - p.idle[G.idleElapsed]);
+    return info;
+  }
+
+  var CHAT_LOG_MAX = 300;
+  var chat = { seen: typeof WeakSet === "function" ? new WeakSet() : null, log: [], nextId: 1, battleId: undefined };
+
+  function chatAuthor(message) {
+    var label = null;
+    try { label = typeof message[G.msgAuthor] === "function" ? message[G.msgAuthor]() : null; } catch (e) {}
+    if (!label) return { author: "?", rank: null, side: null };
+    var relation = enumStr(label[G.labelRelation]);
+    return {
+      author: String(label[G.labelName]),
+      rank: typeof label[G.labelRank] === "number" ? label[G.labelRank] : null,
+      side: relation === GAME.relations.ally ? "ally" : (relation === GAME.relations.enemy ? "enemy" : null)
+    };
+  }
+
+  function chatEntry(message) {
+    var entry = { id: chat.nextId++, time: Date.now() }, who;
+    if (G.msgText in message || G.teamMsgText in message) {
+      who = chatAuthor(message);
+      entry.author = who.author;
+      entry.rank = who.rank;
+      entry.side = who.side;
+      entry.team = G.teamMsgText in message;
+      entry.text = String(entry.team ? message[G.teamMsgText] : message[G.msgText]);
+    } else if (G.spectatorMsgText in message) {
+      entry.author = "наблюдатель";
+      entry.side = null;
+      entry.text = String(message[G.spectatorMsgText]);
+    } else if (G.systemMsgText in message) {
+      entry.system = true;
+      entry.text = String(message[G.systemMsgText]);
+    } else {
+      return null;
+    }
+    return entry;
+  }
+
+  function chatMessages() {
+    if (chat.battleId !== battle.id) {
+      chat.battleId = battle.id;
+      chat.log = [];
+    }
+    var state = uiState(), battleChat = state && state[G.battleChat];
+    var items = battleChat ? iterList(battleChat[G.chatMessages]) : [], i, item, entry;
+    for (i = 0; i < items.length; i++) {
+      item = items[i];
+      if (!item || typeof item !== "object" || !chat.seen || chat.seen.has(item)) continue;
+      chat.seen.add(item);
+      entry = chatEntry(item);
+      if (entry) chat.log.push(entry);
+    }
+    if (chat.log.length > CHAT_LOG_MAX) chat.log.splice(0, chat.log.length - CHAT_LOG_MAX);
+    return chat.log;
+  }
+
+  var BATTLE_INFO_INTERVAL_MS = 250;
+  var battleInfoSent = { battleId: undefined, texts: {}, nextAt: 0 };
+
+  function resendBattleInfo() {
+    battleInfoSent.battleId = undefined;
+    battleInfoSent.texts = {};
+  }
+
+  function sendIfChanged(kind, payload) {
+    var text = JSON.stringify(payload);
+    if (battleInfoSent.texts[kind] === text) return;
+    battleInfoSent.texts[kind] = text;
+    toBridge(kind, payload);
+  }
+
+  function publishBattleInfo(now) {
+    if (now < battleInfoSent.nextAt) return;
+    battleInfoSent.nextAt = now + BATTLE_INFO_INTERVAL_MS;
+    if (battleInfoSent.battleId !== battle.id) {
+      resendBattleInfo();
+      battleInfoSent.battleId = battle.id;
+      toBridge("battle", { id: battle.id });
+    }
+    try { sendIfChanged("chat", { messages: chatMessages() }); } catch (eC) {}
+    try { sendIfChanged("kills", { kills: killFeed() }); } catch (eK) {}
+    try { sendIfChanged("players", { teams: playerTeams() }); } catch (eP) {}
   }
 
   function stepParkourCamera(factor) {
@@ -4255,6 +4551,7 @@
       mapWindow.connected = true;
       mapWindow.openRequested = true;
       mapWindow.sentMapId = null;
+      resendBattleInfo();
       logDebug("map window connected");
     } else if (msg.kind === "disconnected") {
       mapWindow.connected = false;

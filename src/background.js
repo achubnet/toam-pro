@@ -18,7 +18,7 @@
   function openMapWindow(tabId) {
     if (tabId == null) return;
     chrome.windows.create({
-      url: chrome.runtime.getURL("src/map/map.html?tab=" + tabId),
+      url: chrome.runtime.getURL("src/window/window.html?tab=" + tabId),
       type: "popup",
       width: MAP_WINDOW.width,
       height: MAP_WINDOW.height

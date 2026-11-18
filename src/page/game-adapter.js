@@ -19,15 +19,48 @@
     // list
     size: "e1", get: "g1",
 
+    // kotlin map and set
+    mapEntries: "u1", iterator: "t", hasNext: "u", next: "v", entryKey: "v2", entryValue: "w2", mapGet: "z2",
+    setContains: "h1",
+
     // body
     bodyState: "v9i_1", position: "i9j_1", orientation: "g9j_1", velocity: "f9j_1", angularVelocity: "h9j_1",
     bodyOwner: "b9i_1", bodyShapes: "o9i_1", bodyMovable: "d9i_1", bodyLink: "c9i_1",
 
     // entity
-    entityComponents: "gz1_1",
+    entityComponents: "gz1_1", entityTags: "ryw_1",
 
     // health
     healthCurrent: "h12o_1", healthMax: "g12o_1", healthEvent: "f12o_1",
+
+    // own tank
+    turretAngle: "lzr_1", elevationAngle: "tzr_1", turretSpeedNow: "wzy_1", turretSpeedMax: "uzy_1",
+    turretController: "qzy_1", elevationSpeedNow: "r1a8_1", elevationSpeedMax: "s1a8_1", barrelMount: "n1a8_1",
+    reloadProgress: "w12q", reloadTime: "v18v_1", reloadReadyAt: "w18v_1", reloadStunned: "x18v_1",
+    salvoReloadTime: "g18y_1", salvoEndsAt: "j18y_1", magnumReloadTime: "q1a9_1", magnumCharge: "w1a9_1",
+    idlePeriod: "r15i_1", idleWarnAt: "s15i_1", idleElapsed: "t15i_1", idlePaused: "w15i_1", weaponKind: "l15j_1",
+
+    // ui store
+    storeState: "faq_1", storeReducer: "baq_1", storeDispatch: "daq_1", storeWatcher: "e1gg_1", watchedStore: "tap_1",
+
+    // chat
+    battleChat: "hpw_1", chatMessages: "otk_1", msgText: "ztj_1", teamMsgText: "ftk_1",
+    spectatorMsgText: "jtk_1", systemMsgText: "ktk_1", msgAuthor: "ctk",
+
+    // ui state
+    session: "opu_1", ownUserId: "iqn_1", battleUsers: "xpv_1", actionsLog: "fpw_1",
+
+    // battle users
+    onlineUsers: "yq9_1", userNames: "zq9_1", userRanks: "aqa_1", userTeams: "dqa_1", userStats: "eqa_1",
+    userTanks: "gqa_1", statDeaths: "jc2_1", statKills: "lc2_1", statScore: "mc2_1", hullBaseId: "ol3_1",
+    turretBaseId: "rl3_1",
+
+    // actions log
+    logEntries: "eqd_1", killerLabel: "xqd_1", victimLabel: "yqd_1", damageType: "zqd_1", critical: "aqe_1",
+    actorLabel: "cqe_1", actionType: "dqe_1",
+
+    // user label
+    labelUserId: "uta_1", labelName: "vta_1", labelRank: "wta_1", labelClan: "yta_1", labelRelation: "zta_1",
 
     // world
     entityWorld: "zz0_1", systemEntity: "yz3_1", raycast: "z9l", physics: "zyv_1", controllers: "syw_1",
@@ -124,6 +157,9 @@
       initNewStylePoint: "initNewStylePoint"
     },
     teams: { a: "TEAM_A", b: "TEAM_B" },
+    relations: { ally: "ALLY", enemy: "ENEMY" },
+    entityTags: { localTank: "LocalTank" },
+    actionTypes: { suicide: "SUICIDE" },
     flagStates: { atBase: "AT_BASE", dropped: "DROPPED", carried: "CARRIED", away: ["DROPPED", "CARRIED", "EXILED", "FLYING"] },
     aimShowing: "StartedIndicating",
     parkourFormat: /PARKOUR|ПАРКУР/i,
