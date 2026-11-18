@@ -23,6 +23,12 @@
     bodyState: "v9i_1", position: "i9j_1", orientation: "g9j_1", velocity: "f9j_1", angularVelocity: "h9j_1",
     bodyOwner: "b9i_1", bodyShapes: "o9i_1", bodyMovable: "d9i_1", bodyLink: "c9i_1",
 
+    // entity
+    entityComponents: "gz1_1",
+
+    // health
+    healthCurrent: "h12o_1", healthMax: "g12o_1", healthEvent: "f12o_1",
+
     // world
     entityWorld: "zz0_1", systemEntity: "yz3_1", raycast: "z9l", physics: "zyv_1", controllers: "syw_1",
     jsMap: "s2a_1", renderCamera: "yyw_1", cameraRotation: "u35_1",

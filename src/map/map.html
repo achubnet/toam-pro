@@ -13,14 +13,14 @@
       <button data-action="map-out" title="Отдалить карту">−</button>
       <button data-action="map-in" title="Приблизить карту">+</button>
     </div>
-    <div class="group" data-parkour>
+    <div class="group">
       <span class="label">Камера</span>
-      <button data-action="camera-closer" title="Камера ближе">−</button>
-      <button data-action="camera-farther" title="Камера дальше">+</button>
+      <button data-action="camera-closer" data-parkour-only title="Камера ближе">−</button>
+      <button data-action="camera-farther" data-parkour-only title="Камера дальше">+</button>
     </div>
-    <div class="group" data-parkour>
-      <button data-action="bushes">Кусты</button>
-    </div>
+    <label class="switch"><input type="checkbox" data-switch="bushes" data-parkour-only><span>Скрыть кусты</span></label>
+    <label class="switch"><input type="checkbox" data-switch="health"><span>Здоровье</span></label>
+    <label class="switch" title="Клавиши из этого окна идут в игру"><input type="checkbox" data-switch="control"><span>Управление</span></label>
     <div id="info"></div>
     <div id="status"></div>
   </footer>

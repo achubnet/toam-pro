@@ -3346,7 +3346,8 @@
       if (!pos || !isFiniteNum(pos.x) || !isFiniteNum(pos.y)) continue;
       col = null;
       try { col = m[G.markerSprite] && m[G.markerSprite][G.spriteTint]; } catch (eC) {}
-      out.push({ pos: pos, ally: radarColorIsAlly(col), raw: col, key: (e[G.entryEntity] && typeof e[G.entryEntity] === "object") ? e[G.entryEntity] : m });
+      var entity = e[G.entryEntity] && typeof e[G.entryEntity] === "object" ? e[G.entryEntity] : null;
+      out.push({ pos: pos, ally: radarColorIsAlly(col), raw: col, key: entity || m, entity: entity });
     }
     return out;
   }
@@ -4038,12 +4039,42 @@
     return mapCache.status || "жду бой";
   }
 
+  function isHealthComponent(c) {
+    return !!c && typeof c === "object" && G.healthEvent in c &&
+      isFiniteNum(c[G.healthCurrent]) && isFiniteNum(c[G.healthMax]) && c[G.healthMax] > 0;
+  }
+
+  function entityHealth(entity) {
+    var components, found = null;
+    try { components = entity && entity[G.entityComponents] && entity[G.entityComponents][G.jsMap]; } catch (e) { return null; }
+    if (!components || typeof components.forEach !== "function") return null;
+    components.forEach(function (list) {
+      if (found || !list) return;
+      try {
+        var first = list[G.size]() > 0 ? list[G.get](0) : null;
+        if (isHealthComponent(first)) found = first;
+      } catch (e) {}
+    });
+    return found ? { now: Math.max(0, Math.round(found[G.healthCurrent])), max: Math.round(found[G.healthMax]) } : null;
+  }
+
+  function visibleHealth(entity, ally) {
+    if (!entity || (ally !== true && !isParkour())) return null;
+    return entityHealth(entity);
+  }
+
+  function ownEntity() {
+    var body = ownBodyFromCamera() || hooks.physicsBody;
+    try { return body && body[G.bodyOwner] || null; } catch (e) { return null; }
+  }
+
   function buildMapFrame() {
     var now = Date.now(), local = localTeamName(), i, j, t, hd;
     var me = lastMe && isFiniteNum(lastMe.x) ? {
       x: lastMe.x, y: lastMe.y,
       z: isFiniteNum(lastMe.z) ? lastMe.z : null,
-      heading: isFiniteNum(lastMe.heading) ? lastMe.heading : null
+      heading: isFiniteNum(lastMe.heading) ? lastMe.heading : null,
+      hp: entityHealth(ownEntity())
     } : null;
     var ray = null;
     if (me) {
@@ -4068,19 +4099,25 @@
       t = markers[i];
       hd = radarHeading(t, now);
       if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
-      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd });
+      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity, t.ally) });
     }
 
-    var carriers = [], f, flagLocal, carrierTeam;
+    var carriers = [], f, flagLocal, carrierTeam, carrierMarker, carrierSide;
     for (i = 0; i < carried.length; i++) {
       f = carried[i];
       flagLocal = f.local || local;
       carrierTeam = f.team === GAME.teams.a || f.team === GAME.teams.b ? otherTeam(f.team) : "";
       hd = radarHeading({ key: f.key, pos: f.pos }, now);
-      for (j = 0; !hd && j < markers.length; j++) {
-        if (Math.abs(markers[j].pos.x - f.pos.x) < 4 && Math.abs(markers[j].pos.y - f.pos.y) < 4) hd = radarHeading(markers[j], now);
+      carrierMarker = null;
+      for (j = 0; j < markers.length; j++) {
+        if (Math.abs(markers[j].pos.x - f.pos.x) < 4 && Math.abs(markers[j].pos.y - f.pos.y) < 4) { carrierMarker = markers[j]; break; }
       }
-      carriers.push({ x: f.pos.x, y: f.pos.y, side: carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown", flagSide: sideOf(f.team, flagLocal), hd: hd });
+      if (!hd && carrierMarker) hd = radarHeading(carrierMarker, now);
+      carrierSide = carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown";
+      carriers.push({
+        x: f.pos.x, y: f.pos.y, side: carrierSide, flagSide: sideOf(f.team, flagLocal), hd: hd,
+        hp: carrierMarker ? visibleHealth(carrierMarker.entity, carrierSide === "ally") : null
+      });
     }
 
     var bases = [], point, pos, team;
@@ -4184,9 +4221,30 @@
     bumpParkourCam(factor);
   }
 
+  var forwardedKeys = typeof WeakSet === "function" ? new WeakSet() : null;
+
+  function pressKey(command) {
+    if (command.type !== "keydown" && command.type !== "keyup") return;
+    var keyCode = Number(command.keyCode) || 0;
+    var ev = new KeyboardEvent(command.type, {
+      code: String(command.code || ""), key: String(command.key || ""), keyCode: keyCode, which: keyCode,
+      shiftKey: !!command.shift, ctrlKey: !!command.ctrl, altKey: !!command.alt, metaKey: !!command.meta,
+      bubbles: true, cancelable: true, composed: true
+    });
+    if (ev.keyCode !== keyCode) {
+      try {
+        Object.defineProperty(ev, "keyCode", { value: keyCode });
+        Object.defineProperty(ev, "which", { value: keyCode });
+      } catch (e) {}
+    }
+    if (forwardedKeys) forwardedKeys.add(ev);
+    (document.activeElement || document.body || document).dispatchEvent(ev);
+  }
+
   function runCommand(command) {
     if (command.name === "camera") stepParkourCamera(Number(command.factor) || 1);
     else if (command.name === "bushes") setBushesHidden(!!command.hide);
+    else if (command.name === "key") pressKey(command);
   }
 
   function onBridgeMessage(event) {
@@ -4214,7 +4272,7 @@
     var minus = ev.code === "Minus" || ev.code === "NumpadSubtract";
     if ((plus || minus) && ev.shiftKey) stepParkourCamera(plus ? 1.15 : 1 / 1.15);
     else if ((plus || minus) && mapWindow.connected) toBridge("zoom", { factor: plus ? 1.25 : 0.8 });
-    else if (ev.code === "KeyM" && !ev.shiftKey) openMapWindow();
+    else if (ev.code === "KeyM" && !ev.shiftKey && !(forwardedKeys && forwardedKeys.has(ev))) openMapWindow();
     else return;
     ev.preventDefault();
     ev.stopPropagation();

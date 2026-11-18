@@ -1,15 +1,15 @@
 /*
  * frame = {
- *   me: { x, y, z, heading } | null,
+ *   me: { x, y, z, heading, hp } | null,         hp: { now, max } | null
  *   ray: { dx, dy, dist } | null,
- *   tanks: [{ x, y, z, side, hd }],                side: ally | enemy | unknown, hd: {x, y} | null
- *   carriers: [{ x, y, side, flagSide, hd }],
+ *   tanks: [{ x, y, z, side, hd, hp }],            side: ally | enemy | unknown, hd: {x, y} | null
+ *   carriers: [{ x, y, side, flagSide, hd, hp }],
  *   bases: [{ x, y, side, taken }],                side: ally | enemy | red | blue | neutral
  *   dropped: [{ x, y, side }],
  *   cps: [{ x, y, letter, live, owner, ring, frac, active }],
  *   aim: { pts: [[x, y], ...], land: [x, y] | null } | null
  * }
- * view = { zoom, follow, drive }
+ * view = { zoom, follow, drive, health }
  */
 (function (root) {
   "use strict";
@@ -72,20 +72,55 @@
     drawArrow(ctx, x, y, dx, dy, "#ffffff", "#000000", 1);
   }
 
-  function drawBlinkingFlag(ctx, x, y, color) {
-    var on = Math.floor(Date.now() / 250) % 2 === 0;
+  function drawFlagIcon(ctx, x, y, color, k, outline) {
+    var top = y - 20 * k, w = 14 * k, h = 10 * k;
     ctx.save();
-    ctx.globalAlpha = on ? 1 : 0.3;
     ctx.lineJoin = "round";
+    ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.moveTo(x, y); ctx.lineTo(x, y - 18);
-    ctx.strokeStyle = "#000"; ctx.lineWidth = 4; ctx.stroke();
-    ctx.strokeStyle = "#ffd400"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.moveTo(x, y); ctx.lineTo(x, top);
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 4 * k; ctx.stroke();
+    ctx.strokeStyle = outline; ctx.lineWidth = 2 * k; ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(x, y - 18); ctx.lineTo(x + 13, y - 13.5); ctx.lineTo(x, y - 9); ctx.closePath();
-    ctx.fillStyle = color;
-    ctx.strokeStyle = "#ffd400"; ctx.lineWidth = 2;
-    ctx.fill(); ctx.stroke();
+    ctx.moveTo(x, top);
+    ctx.bezierCurveTo(x + w * 0.35, top - 3 * k, x + w * 0.65, top + 3 * k, x + w, top);
+    ctx.lineTo(x + w, top + h);
+    ctx.bezierCurveTo(x + w * 0.65, top + h + 3 * k, x + w * 0.35, top + h - 3 * k, x, top + h);
+    ctx.closePath();
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 3 * k; ctx.stroke();
+    ctx.fillStyle = color; ctx.fill();
+    ctx.strokeStyle = outline; ctx.lineWidth = 1.2 * k; ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 2.2 * k, 0, Math.PI * 2);
+    ctx.fillStyle = outline; ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBlinkingFlag(ctx, x, y, color) {
+    ctx.save();
+    ctx.globalAlpha = Math.floor(Date.now() / 250) % 2 === 0 ? 1 : 0.3;
+    drawFlagIcon(ctx, x, y, color, 0.85, "#ffd400");
+    ctx.restore();
+  }
+
+  function healthColor(frac) {
+    if (frac > 0.6) return "#7dff7a";
+    if (frac > 0.3) return "#ffd84a";
+    return "#ff6b5a";
+  }
+
+  function drawHealth(ctx, x, y, hp) {
+    if (!hp || !isFiniteNum(hp.now)) return;
+    ctx.save();
+    ctx.font = "bold 10px ui-sans-serif, system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.strokeText(String(hp.now), x, y);
+    ctx.fillStyle = healthColor(hp.max > 0 ? hp.now / hp.max : 1);
+    ctx.fillText(String(hp.now), x, y);
     ctx.restore();
   }
 
@@ -93,37 +128,27 @@
     return p.x < -m || p.y < -m || p.x > W + m || p.y > H + m;
   }
 
+  function baseColor(side) {
+    return side === "neutral" || !SIDE[side] ? "#c9c14a" : SIDE[side];
+  }
+
   function drawBases(ctx, toScreen, W, H, bases) {
-    var now = Date.now(), i, o, p, taken, blink, r = 8, fill, stroke;
+    var i, o, p, blinkOn = (Date.now() / 180) % 2 < 1;
     for (i = 0; i < (bases || []).length; i++) {
       o = bases[i];
       p = toScreen(o.x, o.y);
-      if (offView(p, W, H, 20)) continue;
-      if (o.side === "neutral" || !SIDE[o.side]) { fill = "#c9c14a"; stroke = "#fff38a"; }
-      else { fill = SIDE[o.side]; stroke = "#ffffff"; }
-      taken = !!o.taken;
-      blink = taken && ((now / 180) % 2 < 1);
-      ctx.globalAlpha = taken && !blink ? 0.28 : 1;
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y - r - 2);
-      ctx.lineTo(p.x + r, p.y + r - 1);
-      ctx.lineTo(p.x - r, p.y + r - 1);
-      ctx.closePath();
-      ctx.fillStyle = fill;
-      ctx.strokeStyle = taken ? "#fff" : stroke;
-      ctx.lineWidth = taken ? 2.5 : 1.5;
-      ctx.fill();
-      ctx.stroke();
-      if (taken) {
+      if (offView(p, W, H, 24)) continue;
+      ctx.save();
+      if (o.taken) {
+        ctx.globalAlpha = blinkOn ? 1 : 0.28;
         ctx.strokeStyle = "#fff";
         ctx.lineWidth = 1.25;
         ctx.beginPath();
-        ctx.arc(p.x, p.y + 1, r + 3, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
         ctx.stroke();
       }
-      ctx.fillStyle = "#fff";
-      ctx.fillText("F", p.x, p.y + 1);
-      ctx.globalAlpha = 1;
+      drawFlagIcon(ctx, p.x - 4, p.y + 8, baseColor(o.side), 1, "#ffffff");
+      ctx.restore();
     }
   }
 
@@ -183,18 +208,12 @@
       d = f.dropped[i];
       p = toScreen(d.x, d.y);
       if (offView(p, W, H, 20)) continue;
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y - 10); ctx.lineTo(p.x + 8, p.y + 6); ctx.lineTo(p.x - 8, p.y + 6); ctx.closePath();
-      ctx.fillStyle = sideColor(d.side, SIDE.neutral);
-      ctx.strokeStyle = "#ffd400";
-      ctx.lineWidth = 2;
-      ctx.fill();
-      ctx.stroke();
+      drawFlagIcon(ctx, p.x - 4, p.y + 8, sideColor(d.side, SIDE.neutral), 1, "#ffd400");
     }
     ctx.restore();
   }
 
-  function drawTanks(ctx, toScreen, W, H, tanks, meZ) {
+  function drawTanks(ctx, toScreen, W, H, tanks, meZ, showHealth) {
     var i, t, p, col, dz;
     ctx.save();
     for (i = 0; i < (tanks || []).length; i++) {
@@ -222,11 +241,12 @@
         ctx.closePath();
         ctx.fill();
       }
+      if (showHealth) drawHealth(ctx, p.x + 9, p.y + 8, t.hp);
     }
     ctx.restore();
   }
 
-  function drawCarriers(ctx, toScreen, W, H, carriers) {
+  function drawCarriers(ctx, toScreen, W, H, carriers, showHealth) {
     var i, c, p, col;
     for (i = 0; i < (carriers || []).length; i++) {
       c = carriers[i];
@@ -242,6 +262,7 @@
         ctx.fill(); ctx.stroke();
       }
       drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(c.flagSide, SIDE.neutral));
+      if (showHealth) drawHealth(ctx, p.x + 9, p.y + 8, c.hp);
     }
   }
 
@@ -330,8 +351,8 @@
       return { x: W / 2 + (x - cx) * viewM, y: H / 2 - (y - cy) * viewM };
     }
     try { drawObjectives(ctx, toScreen, W, H, f); } catch (eObj) {}
-    try { drawTanks(ctx, toScreen, W, H, f.tanks, me && isFiniteNum(me.z) ? me.z : null); } catch (eT) {}
-    try { drawCarriers(ctx, toScreen, W, H, f.carriers); } catch (eC) {}
+    try { drawTanks(ctx, toScreen, W, H, f.tanks, me && isFiniteNum(me.z) ? me.z : null, view.health); } catch (eT) {}
+    try { drawCarriers(ctx, toScreen, W, H, f.carriers, view.health); } catch (eC) {}
     try { drawAim(ctx, toScreen, f.aim); } catch (eA) {}
     if (me && !isFiniteNum(me.heading)) {
       try {
@@ -369,6 +390,10 @@
       ctx.stroke();
       drawSelfArrow(ctx, p.x, p.y, hx, -hy);
     } catch (eSelf) {}
+    if (me && view.health) try {
+      var ph = toScreen(me.x, me.y);
+      drawHealth(ctx, ph.x + 11, ph.y + 10, me.hp);
+    } catch (eHp) {}
     if (b && viewM) {
       var barM = niceMetres((W / viewM));
       var barPx = barM * viewM;
