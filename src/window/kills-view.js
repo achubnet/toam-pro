@@ -45,12 +45,12 @@
 
   function render(list, kills) {
     var known = list.known || (list.known = {});
-    var added = 0;
+    var added = [];
     (kills || []).forEach(function (k) {
       if (known[k.id]) return;
       known[k.id] = true;
       list.insertBefore(item(k), list.firstChild);
-      added++;
+      added.push(k);
     });
     while (list.children.length > MAX_ITEMS) list.removeChild(list.lastChild);
     return added;

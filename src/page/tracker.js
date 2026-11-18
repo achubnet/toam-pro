@@ -4136,7 +4136,7 @@
       if (!hd && carrierMarker) hd = radarHeading(carrierMarker, now);
       carrierSide = carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown";
       carriers.push({
-        x: f.pos.x, y: f.pos.y, side: carrierSide, flagSide: sideOf(f.team, flagLocal), hd: hd,
+        x: f.pos.x, y: f.pos.y, z: f.pos.z, side: carrierSide, flagSide: sideOf(f.team, flagLocal), hd: hd,
         hp: carrierMarker ? visibleHealth(carrierMarker.entity, carrierSide === "ally") : null
       });
     }
@@ -4428,25 +4428,25 @@
   var CHAT_LOG_MAX = 300;
   var chat = { seen: typeof WeakSet === "function" ? new WeakSet() : null, log: [], nextId: 1, battleId: undefined };
 
-  function chatAuthor(message) {
+  function chatAuthor(message, me) {
     var label = null;
     try { label = typeof message[G.msgAuthor] === "function" ? message[G.msgAuthor]() : null; } catch (e) {}
-    if (!label) return { author: "?", rank: null, side: null };
-    var relation = enumStr(label[G.labelRelation]);
+    if (!label) return { author: "?", rank: null, side: null, me: false };
+    var player = labelPlayer(label, me);
     return {
-      author: String(label[G.labelName]),
-      rank: typeof label[G.labelRank] === "number" ? label[G.labelRank] : null,
-      side: relation === GAME.relations.ally ? "ally" : (relation === GAME.relations.enemy ? "enemy" : null)
+      author: player.name, side: player.side, me: player.me,
+      rank: typeof label[G.labelRank] === "number" ? label[G.labelRank] : null
     };
   }
 
-  function chatEntry(message) {
+  function chatEntry(message, me) {
     var entry = { id: chat.nextId++, time: Date.now() }, who;
     if (G.msgText in message || G.teamMsgText in message) {
-      who = chatAuthor(message);
+      who = chatAuthor(message, me);
       entry.author = who.author;
       entry.rank = who.rank;
       entry.side = who.side;
+      entry.me = who.me;
       entry.team = G.teamMsgText in message;
       entry.text = String(entry.team ? message[G.teamMsgText] : message[G.msgText]);
     } else if (G.spectatorMsgText in message) {
@@ -4467,13 +4467,13 @@
       chat.battleId = battle.id;
       chat.log = [];
     }
-    var state = uiState(), battleChat = state && state[G.battleChat];
+    var state = uiState(), battleChat = state && state[G.battleChat], me = state ? ownUserKey(state) : null;
     var items = battleChat ? iterList(battleChat[G.chatMessages]) : [], i, item, entry;
     for (i = 0; i < items.length; i++) {
       item = items[i];
       if (!item || typeof item !== "object" || !chat.seen || chat.seen.has(item)) continue;
       chat.seen.add(item);
-      entry = chatEntry(item);
+      entry = chatEntry(item, me);
       if (entry) chat.log.push(entry);
     }
     if (chat.log.length > CHAT_LOG_MAX) chat.log.splice(0, chat.log.length - CHAT_LOG_MAX);
@@ -4481,6 +4481,7 @@
   }
 
   var BATTLE_INFO_INTERVAL_MS = 250;
+  var PAGE_SESSION = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   var battleInfoSent = { battleId: undefined, texts: {}, nextAt: 0 };
 
   function resendBattleInfo() {
@@ -4501,7 +4502,7 @@
     if (battleInfoSent.battleId !== battle.id) {
       resendBattleInfo();
       battleInfoSent.battleId = battle.id;
-      toBridge("battle", { id: battle.id });
+      toBridge("battle", { id: battle.id, session: PAGE_SESSION });
     }
     try { sendIfChanged("chat", { messages: chatMessages() }); } catch (eC) {}
     try { sendIfChanged("kills", { kills: killFeed() }); } catch (eK) {}

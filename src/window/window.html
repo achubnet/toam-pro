@@ -27,14 +27,17 @@
       <button data-action="map-out" title="Отдалить карту">−</button>
       <button data-action="map-in" title="Приблизить карту">+</button>
     </div>
+    <label class="switch" title="Карта поворачивается за дулом: всё, что впереди, — сверху"><input type="checkbox" data-switch="rotate"><span>Прикрепить камеру</span></label>
+    <label class="switch" title="Стрелка выше или ниже тебя возле каждого танка"><input type="checkbox" data-switch="heights"><span>Высота</span></label>
+    <label class="switch" title="Танки под потолком полупрозрачные"><input type="checkbox" data-switch="roofs"><span>Под крышей</span></label>
+    <label class="switch"><input type="checkbox" data-switch="health"><span>Здоровье</span></label>
+    <label class="switch"><input type="checkbox" data-switch="tank"><span>Танк</span></label>
     <div class="group">
       <span class="label">Камера</span>
       <button data-action="camera-closer" data-parkour-only title="Камера ближе">−</button>
       <button data-action="camera-farther" data-parkour-only title="Камера дальше">+</button>
     </div>
     <label class="switch"><input type="checkbox" data-switch="bushes" data-parkour-only><span>Скрыть кусты</span></label>
-    <label class="switch"><input type="checkbox" data-switch="health"><span>Здоровье</span></label>
-    <label class="switch"><input type="checkbox" data-switch="tank"><span>Танк</span></label>
     <label class="switch" title="Клавиши из этого окна идут в игру"><input type="checkbox" data-switch="control"><span>Управление</span></label>
     <div id="info"></div>
     <div id="status"></div>

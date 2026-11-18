@@ -501,6 +501,65 @@
     return cnv;
   }
 
+  var ROOF_BUCKET_M = 8;
+  var ROOF_CLEARANCE_M = 1.2;
+  var ROOF_MAX_M = 60;
+
+  function lowestZ(pts, fallback) {
+    var z = Infinity, i;
+    for (i = 0; i < pts.length; i++) if (isFiniteNum(pts[i].z) && pts[i].z < z) z = pts[i].z;
+    return z === Infinity ? fallback : Math.min(z, isFiniteNum(fallback) ? fallback : z);
+  }
+
+  function buildRoofIndex(surfaces, b) {
+    var cols = Math.max(1, Math.ceil((b.xmax - b.xmin) / ROOF_BUCKET_M));
+    var rows = Math.max(1, Math.ceil((b.ymax - b.ymin) / ROOF_BUCKET_M));
+    var buckets = new Array(cols * rows);
+    function cell(v, min, n) {
+      return Math.max(0, Math.min(n - 1, Math.floor((v - min) / ROOF_BUCKET_M)));
+    }
+    function add(pts, bottom) {
+      if (!pts || pts.length < 3 || !isFiniteNum(bottom)) return;
+      var item = { pts: pts, bottom: bottom, minx: Infinity, maxx: -Infinity, miny: Infinity, maxy: -Infinity }, i, cx, cy;
+      for (i = 0; i < pts.length; i++) {
+        item.minx = Math.min(item.minx, pts[i].x); item.maxx = Math.max(item.maxx, pts[i].x);
+        item.miny = Math.min(item.miny, pts[i].y); item.maxy = Math.max(item.maxy, pts[i].y);
+      }
+      var c0 = cell(item.minx, b.xmin, cols), c1 = cell(item.maxx, b.xmin, cols);
+      var r0 = cell(item.miny, b.ymin, rows), r1 = cell(item.maxy, b.ymin, rows);
+      for (cy = r0; cy <= r1; cy++) {
+        for (cx = c0; cx <= c1; cx++) (buckets[cy * cols + cx] || (buckets[cy * cols + cx] = [])).push(item);
+      }
+    }
+    (surfaces.floors || []).forEach(function (f) { add(f.pts, lowestZ(f.pts, f.z)); });
+    (surfaces.slopes || []).forEach(function (f) { add(f.pts, lowestZ(f.pts, f.z)); });
+    (surfaces.tall || []).concat(surfaces.props || []).forEach(function (r) { add(convexHullXY(r.corners), r.ext.z0); });
+    return { cols: cols, rows: rows, xmin: b.xmin, ymin: b.ymin, buckets: buckets };
+  }
+
+  function insidePolygon(pts, x, y) {
+    var inside = false, i, j, a, c;
+    for (i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      a = pts[i]; c = pts[j];
+      if ((a.y > y) !== (c.y > y) && x < (c.x - a.x) * (y - a.y) / (c.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+
+  function roofAbove(index, x, y, z) {
+    if (!index || !isFiniteNum(x) || !isFiniteNum(y) || !isFiniteNum(z)) return false;
+    var cx = Math.floor((x - index.xmin) / ROOF_BUCKET_M), cy = Math.floor((y - index.ymin) / ROOF_BUCKET_M);
+    if (cx < 0 || cy < 0 || cx >= index.cols || cy >= index.rows) return false;
+    var list = index.buckets[cy * index.cols + cx] || [], i, it;
+    for (i = 0; i < list.length; i++) {
+      it = list[i];
+      if (it.bottom <= z + ROOF_CLEARANCE_M || it.bottom > z + ROOF_MAX_M) continue;
+      if (x < it.minx || x > it.maxx || y < it.miny || y > it.maxy) continue;
+      if (insidePolygon(it.pts, x, y)) return true;
+    }
+    return false;
+  }
+
   function buildMapLayers(data, log) {
     log = log || function () {};
     if (!data || !data.collision) return false;
@@ -698,9 +757,10 @@
       " edges=" + edges.length + (mask ? " drive=" + mask.w + "x" + mask.h : ""));
     return {
       offscreen: fillC, outlines: outC, driveCanvas: driveC, driveMask: mask,
-      layerLow: lowC, layerHigh: highC, splitZ: splitZ, bounds: bmap, scale: scale, stats: surfStats
+      layerLow: lowC, layerHigh: highC, splitZ: splitZ, bounds: bmap, scale: scale, stats: surfStats,
+      roofs: buildRoofIndex(surfaces, bmap)
     };
   }
 
-  root.TOC.layers = { build: buildMapLayers, worldToPicture: mapWorldToOff, setOrientation: setOrientation };
+  root.TOC.layers = { build: buildMapLayers, worldToPicture: mapWorldToOff, setOrientation: setOrientation, roofAbove: roofAbove };
 })(window);

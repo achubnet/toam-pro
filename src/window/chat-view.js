@@ -35,15 +35,15 @@
   function render(list, messages) {
     var known = list.known || (list.known = {});
     var stick = list.parentNode.scrollTop + list.parentNode.clientHeight >= list.parentNode.scrollHeight - 8;
-    var added = 0;
+    var added = [];
     (messages || []).forEach(function (m) {
       if (known[m.id]) return;
       known[m.id] = true;
       list.appendChild(item(m));
-      added++;
+      added.push(m);
     });
     while (list.children.length > MAX_ITEMS) list.removeChild(list.firstChild);
-    if (added && stick) list.parentNode.scrollTop = list.parentNode.scrollHeight;
+    if (added.length && stick) list.parentNode.scrollTop = list.parentNode.scrollHeight;
     return added;
   }
 
