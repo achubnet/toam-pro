@@ -139,7 +139,9 @@
       units: units,
       flags: flags,
       points: points,
-      marks: (raw.dead || []).map(function (d) { return { x: d.x, y: d.y, side: d.side, icon: "skull" }; }),
+      marks: (raw.mines || []).map(function (m) {
+        return { x: m.x, y: m.y, side: m.side, icon: "hazard", alpha: m.active ? 1 : 0.55 };
+      }).concat((raw.dead || []).map(function (d) { return { x: d.x, y: d.y, side: d.side, icon: "skull" }; })),
       paths: [path(raw.aim, PATH_COLORS.magnum), path(raw.grenadeAim, PATH_COLORS.grenade)].filter(Boolean),
       info: infoRows(raw),
       banner: banner(raw),

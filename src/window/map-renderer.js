@@ -4,7 +4,7 @@
  *   units: [{ x, y, z, side, dir: { x, y } | null, hp, carrying }],      carrying: side of a carried flag
  *   flags: [{ x, y, side, state }],                                       state: home | taken | loose
  *   points: [{ x, y, label, live, owner, progressSide, progress, active }],
- *   marks: [{ x, y, side, icon }],                                        icon: skull
+ *   marks: [{ x, y, side, icon, alpha }],                                 icon: hazard | skull
  *   paths: [{ pts: [[x, y], ...], end: [x, y] | null, color }]
  * }
  * side: ally | enemy | red | blue | neutral | unknown
@@ -146,13 +146,32 @@
     ctx.restore();
   }
 
-  var MARK_ICONS = { skull: drawSkull };
+  function drawHazard(ctx, x, y, color) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fill();
+    ctx.restore();
+  }
+
+  var MARK_ICONS = { skull: drawSkull, hazard: drawHazard };
 
   function drawMarks(ctx, vt, W, H, marks) {
     for (var i = 0; i < (marks || []).length; i++) {
       var m = marks[i], draw = MARK_ICONS[m.icon], p = vt.toScreen(m.x, m.y);
       if (!draw || offView(p, W, H, 10)) continue;
+      ctx.save();
+      ctx.globalAlpha = typeof m.alpha === "number" ? m.alpha : 1;
       draw(ctx, p.x, p.y, sideColor(m.side, SIDE.unknown));
+      ctx.restore();
     }
   }
 

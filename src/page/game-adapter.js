@@ -37,6 +37,11 @@
     supplySlots: "v125_1", supplyActivate: "p128", supplyRelease: "x128", supplyCooldowns: "s125_1",
     slotCount: "g44", slotCooldown: "n126", cooldownTimes: "z126_1", effectEnd: "x15f_1", worldTime: "cyw_1",
 
+    // mines
+    minesById: "w10h_1", minesByOwner: "v10h_1", mineLocalTank: "x10h_1", minePosition: "a13e_1",
+    mineOwner: "b13e_1", mineStateHolder: "x13d_1", mineState: "t13e_1", mineShape: "e13e_1", mineMesh: "r13g_1",
+    mineFade: "z13g_1",
+
     // grenade aim
     grenadeShown: "h168_1", grenadePointCount: "r168_1", grenadePoints: "j168_1", grenadeHit: "o168_1",
     grenadeMark: "g168_1", grenadeStart: "m168_1", grenadeCharge: "e168_1", grenadeCharging: "y169_1",
@@ -178,6 +183,7 @@
     damageKinds: { damage: "DAMAGE" },
     deadStates: ["DEAD", "DEAD_PHANTOM"],
     overdriveSupply: "ULTIMATE",
+    mineActive: "ACTIVE",
     overdriveFull: 100,
     actionTypes: { suicide: "SUICIDE" },
     flagStates: { atBase: "AT_BASE", dropped: "DROPPED", carried: "CARRIED", away: ["DROPPED", "CARRIED", "EXILED", "FLYING"] },

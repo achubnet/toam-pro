@@ -2616,6 +2616,7 @@
 
   function rememberLiveObjects(obj) {
     rememberUiStore(obj);
+    if (!mineSystem && isMineSystem(obj)) mineSystem = obj;
     rememberCpRuntime(obj);
     rememberFlagObj(obj);
     rememberBattleParams(obj);
@@ -4202,6 +4203,7 @@
       speedKmh: speedState.kmh,
       status: statusText(),
       dead: dead,
+      mines: (function () { try { return visibleMines(); } catch (e) { return []; } })(),
       paused: isPaused(),
       grenadeAim: (function () { try { return grenadeAimState(now); } catch (e) { return null; } })(),
       parkour: { active: isParkour(), bushesHidden: bushesHidden },
@@ -4408,6 +4410,62 @@
   function resetDeaths() {
     deaths.seen.clear();
     deaths.skulls.clear();
+    mineSystem = null;
+  }
+
+  var mineSystem = null;
+  var mineParts = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  function isMineSystem(c) {
+    return !!c && typeof c === "object" && !!c[G.minesById] && typeof c[G.minesById][G.mapEntries] === "function" &&
+      !!c[G.minesByOwner] && G.mineLocalTank in c;
+  }
+
+  function findMineSystem() {
+    if (!mineSystem) mineSystem = entityComponents(taggedEntities(GAME.entityTags.gameMode)[0]).filter(isMineSystem)[0] || null;
+    return mineSystem;
+  }
+
+  function partsOfMine(entity) {
+    var cached = mineParts && mineParts.get(entity);
+    if (cached) return cached;
+    var parts = {};
+    entityComponents(entity).forEach(function (c) {
+      if (!c || typeof c !== "object") return;
+      if (c[G.minePosition] && c[G.mineOwner] != null && G.mineStateHolder in c && G.mineShape in c) parts.battle = c;
+      else if (c[G.mineMesh] && typeof c[G.mineMesh][G.isVisible] === "function" && typeof c[G.mineFade] === "number") parts.mesh = c[G.mineMesh];
+    });
+    if (!parts.battle || !parts.mesh) return null;
+    if (mineParts) mineParts.set(entity, parts);
+    return parts;
+  }
+
+  function mineSide(owner, me, users, myTeam) {
+    if (me != null && String(owner) === me) return "ally";
+    var team = users ? enumStr(kotlinMapGet(users[G.userTeams], owner)) : "";
+    var teamGame = (team === GAME.teams.a || team === GAME.teams.b) && (myTeam === GAME.teams.a || myTeam === GAME.teams.b);
+    return teamGame && team === myTeam ? "ally" : "enemy";
+  }
+
+  function visibleMines() {
+    var sys = findMineSystem();
+    if (!sys) return [];
+    var state = uiState(), users = state && state[G.battleUsers], me = state ? ownUserKey(state) : null, myTeam = "";
+    try { myTeam = enumStr(kotlinMapGet(users[G.userTeams], state[G.session][G.ownUserId])); } catch (e) {}
+    var out = [];
+    kotlinMapEach(sys[G.minesById], function (id, entity) {
+      var parts = partsOfMine(entity), pos;
+      if (!parts) return;
+      try { if (!parts.mesh[G.isVisible]()) return; } catch (e) { return; }
+      pos = vecToM(parseMapVec(parts.battle[G.minePosition]));
+      if (!pos) return;
+      var holder = parts.battle[G.mineStateHolder];
+      out.push({
+        x: pos.x, y: pos.y, z: pos.z, side: mineSide(parts.battle[G.mineOwner], me, users, myTeam),
+        active: enumStr(holder && holder[G.mineState]) === GAME.mineActive
+      });
+    });
+    return out;
   }
 
   function gameModeUserTanks() {
