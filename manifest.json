@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "TO Coords",
+  "description": "Свои координаты, мини-карта и файлы карт Tanki Online",
+  "version": "1.4.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxKI77GnjEvgPkkMLiuygyhUYvF8z8ys+Eeur54KtnFsKP9Yi5y01vQRwO4982V/WVJbPcvV2bx61MxXXx0sKS339UBlcx7rsQFfhW4VPdLB72vgKAYwjaI+AisiliYo5UbCVPakvxV1UkFTXJ7xRt0AMul2oqKIZXZJOoyDpx1C3yH9BlcvbF7QZu4rbs4ktjCjAy2p8h1GJAfb8JiY/4MHtBRiVyQ3NMIAf3lBvnh3aTg9EnSCuCT0Ube7xghHsaX1SEMCFC43+b9a5hkty8PE3w9E7cDK1kPRC3chQ/TXGCfc6NifLtBe0jRnA/5ZNfShCbsfEJudbYeZ2XNTtYQIDAQAB",
+  "icons": {
+    "16": "img/icon/16.png",
+    "32": "img/icon/32.png",
+    "48": "img/icon/48.png",
+    "96": "img/icon/96.png",
+    "128": "img/icon/128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "img/icon/16.png",
+      "32": "img/icon/32.png",
+      "48": "img/icon/48.png",
+      "128": "img/icon/128.png"
+    }
+  },
+  "background": {
+    "service_worker": "scripts/background.js"
+  },
+  "permissions": [
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "*://*.tankionline.com/*",
+    "*://*.test-ru.tankionline.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.tankionline.com/*",
+        "*://*.test-ru.tankionline.com/*"
+      ],
+      "js": [
+        "scripts/content.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "*://*.tankionline.com/*",
+        "*://*.test-ru.tankionline.com/*"
+      ],
+      "js": [
+        "scripts/tanki-self-coords.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "maps/*"
+      ],
+      "matches": [
+        "*://*.tankionline.com/*",
+        "*://*.test-ru.tankionline.com/*"
+      ]
+    }
+  ]
+}
