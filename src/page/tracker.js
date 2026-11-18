@@ -1984,9 +1984,9 @@
     return out;
   }
 
-  function rotateEuler(v, e) { return TOC.geometry.rotateEuler(v, e); }
+  function rotateEuler(v, e) { return MapGeometry.rotateEuler(v, e); }
 
-  function add3(a, b) { return TOC.geometry.add3(a, b); }
+  function add3(a, b) { return MapGeometry.add3(a, b); }
 
   function exportBox(box) {
     var pos = vecToM(parseMapVec(box && (box[G.boxPosition] || (typeof box[G.getPosition] === "function" && box[G.getPosition]()))));
@@ -2095,7 +2095,7 @@
     return s || "map";
   }
 
-  function collectBounds(data) { return TOC.geometry.collectBounds(data); }
+  function collectBounds(data) { return MapGeometry.collectBounds(data); }
 
   function downloadJson(filename, data) {
     var blob = new Blob([JSON.stringify(data)], { type: "application/json" });
@@ -3568,6 +3568,7 @@
     battleWatch.bodyRef = null;
     battleWatch.lastBodySig = null;
     clearInstanceState(false);
+    resetDeaths();
     nextScanAt = 0;
     logDebug("battle leave " + reason);
   }
@@ -4122,6 +4123,11 @@
       if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
       tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity, t.ally) });
     }
+    var dead = [];
+    try { dead = updateDeaths(markers, now); } catch (eDead) {}
+    if (me) {
+      try { me.dead = isDead(localTankEntity()); } catch (eMe) {}
+    }
 
     var carriers = [], f, flagLocal, carrierTeam, carrierMarker, carrierSide;
     for (i = 0; i < carried.length; i++) {
@@ -4195,6 +4201,9 @@
       me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim,
       speedKmh: speedState.kmh,
       status: statusText(),
+      dead: dead,
+      paused: isPaused(),
+      grenadeAim: (function () { try { return grenadeAimState(now); } catch (e) { return null; } })(),
       parkour: { active: isParkour(), bushesHidden: bushesHidden },
       tank: (function () { try { return tankInfo(now); } catch (e) { return null; } })()
     };
@@ -4220,7 +4229,7 @@
   function sendMapToWindow() {
     if (!mapCache.data || mapWindow.sentMapId === mapCache.id) return;
     mapWindow.sentMapId = mapCache.id;
-    toBridge("map", { id: mapCache.id, data: mapCache.data, orientation: null });
+    toBridge("map", { id: mapCache.id, data: mapCache.data, options: TOC.viewModel.mapOptions });
   }
 
   function publishToMapWindow(now) {
@@ -4232,7 +4241,7 @@
     publishBattleInfo(now);
     if (now < mapWindow.nextFrameAt) return;
     mapWindow.nextFrameAt = now + FRAME_INTERVAL_MS;
-    toBridge("frame", { frame: buildMapFrame() });
+    toBridge("frame", { frame: TOC.viewModel.frame(buildMapFrame()) });
   }
 
   var DEG = 180 / Math.PI;
@@ -4344,11 +4353,143 @@
     return kills.log;
   }
 
-  function localTankEntity() {
+  function taggedEntities(tag) {
     var world = battleWorld(), list = null;
-    try { list = world && world[G.entityTags] && world[G.entityTags][G.jsMap].get(GAME.entityTags.localTank); } catch (e) {}
-    try { if (list && list[G.size]() > 0) return list[G.get](0); } catch (e2) {}
-    return ownEntity();
+    try { list = world && world[G.entityTags] && world[G.entityTags][G.jsMap].get(tag); } catch (e) {}
+    return iterList(list);
+  }
+
+  function localTankEntity() {
+    return taggedEntities(GAME.entityTags.localTank)[0] || ownEntity();
+  }
+
+  var stateComponents = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  function isDead(entity) {
+    if (!entity || !stateComponents) return false;
+    var c = stateComponents.get(entity);
+    if (!c) {
+      c = entityComponents(entity).filter(function (x) { return x && typeof x === "object" && G.tankState in x; })[0];
+      if (!c) return false;
+      stateComponents.set(entity, c);
+    }
+    return GAME.deadStates.indexOf(enumStr(c[G.tankState])) >= 0;
+  }
+
+  var DEATH_SHOW_MS = 10000;
+  var RADAR_FORGET_MS = 3000;
+  var deaths = { seen: new Map(), skulls: new Map() };
+
+  function updateDeaths(markers, now) {
+    var i, m;
+    for (i = 0; i < markers.length; i++) {
+      m = markers[i];
+      if (!m.entity) continue;
+      deaths.seen.set(m.entity, { x: m.pos.x, y: m.pos.y, z: m.pos.z, side: m.ally === true ? "ally" : (m.ally === false ? "enemy" : "unknown"), at: now });
+      deaths.skulls.delete(m.entity);
+    }
+    deaths.seen.forEach(function (last, entity) {
+      if (deaths.skulls.has(entity)) return;
+      if (isDead(entity)) deaths.skulls.set(entity, { x: last.x, y: last.y, z: last.z, side: last.side, at: now });
+      else if (now - last.at > RADAR_FORGET_MS) deaths.seen.delete(entity);
+    });
+    var out = [];
+    deaths.skulls.forEach(function (skull, entity) {
+      if (now - skull.at > DEATH_SHOW_MS || !isDead(entity)) {
+        deaths.skulls.delete(entity);
+        deaths.seen.delete(entity);
+      } else {
+        out.push({ x: skull.x, y: skull.y, z: skull.z, side: skull.side });
+      }
+    });
+    return out;
+  }
+
+  function resetDeaths() {
+    deaths.seen.clear();
+    deaths.skulls.clear();
+  }
+
+  function gameModeUserTanks() {
+    var mode = taggedEntities(GAME.entityTags.gameMode)[0], comps = entityComponents(mode), i, users;
+    for (i = 0; i < comps.length; i++) {
+      users = comps[i] && comps[i][G.gameModeUsers];
+      if (users && users[G.userTankEntities]) return users[G.userTankEntities];
+    }
+    return null;
+  }
+
+  function entityPlayer(entity) {
+    var userId = null, state = uiState(), users = state && state[G.battleUsers];
+    kotlinMapEach(gameModeUserTanks(), function (id, tank) { if (tank === entity) userId = id; });
+    if (userId == null || !users) return { name: "?", side: "unknown" };
+    var myTeam = enumStr(kotlinMapGet(users[G.userTeams], state[G.session][G.ownUserId]));
+    var team = enumStr(kotlinMapGet(users[G.userTeams], userId));
+    var side = team === GAME.teams.a || team === GAME.teams.b ? sideOf(team, myTeam) : "enemy";
+    return { name: String(kotlinMapGet(users[G.userNames], userId) || "?"), side: side };
+  }
+
+  var DAMAGE_LOG_MAX = 300;
+  var DAMAGE_RETRY_MS = 2000;
+  var damage = {
+    watched: typeof WeakSet === "function" ? new WeakSet() : null,
+    tried: typeof WeakMap === "function" ? new WeakMap() : null,
+    queue: [], log: [], nextId: 1, battleId: undefined, watchedCount: 0, tankCount: 0
+  };
+
+  function damageStats() {
+    return { tanks: damage.tankCount, watched: damage.watchedCount };
+  }
+
+  function damageEventKey(entity) {
+    var signals = entity[G.entitySignals] && entity[G.entitySignals][G.jsMap], found = null;
+    if (!signals || typeof signals.forEach !== "function") return null;
+    signals.forEach(function (signal, key) {
+      if (found != null) return;
+      var nodes = iterList(signal && signal[G.signalListeners]), i, handler;
+      for (i = 0; i < nodes.length; i++) {
+        handler = nodes[i] && nodes[i][G.listenerHandler];
+        if (handler && handler.callableName === GAME.damageHandler) { found = key; return; }
+      }
+    });
+    return found;
+  }
+
+  function watchDamage(entity, own, now) {
+    if (!entity || entity === own || !damage.watched || damage.watched.has(entity)) return;
+    if (now - (damage.tried.get(entity) || 0) < DAMAGE_RETRY_MS) return;
+    damage.tried.set(entity, now);
+    var key = damageEventKey(entity);
+    if (key == null || typeof entity[G.subscribe] !== "function") return;
+    damage.watched.add(entity);
+    damage.watchedCount++;
+    entity[G.subscribe](key, 0, false, function (event) {
+      try { damage.queue.push({ entity: entity, event: event, time: Date.now() }); } catch (e) {}
+    });
+  }
+
+  function damageLog() {
+    var now = Date.now(), own = localTankEntity(), tanks = taggedEntities(GAME.entityTags.tank), i, item, ev;
+    if (damage.battleId !== battle.id) {
+      damage.battleId = battle.id;
+      damage.log = [];
+      damage.queue = [];
+      damage.watchedCount = 0;
+    }
+    damage.tankCount = tanks.filter(function (t) { return t !== own; }).length;
+    for (i = 0; i < tanks.length; i++) watchDamage(tanks[i], own, now);
+    while (damage.queue.length) {
+      item = damage.queue.shift();
+      ev = item.event;
+      if (item.entity === own || enumStr(ev[G.damageKind]) !== GAME.damageKinds.damage) continue;
+      damage.log.push({
+        id: damage.nextId++, time: item.time, target: entityPlayer(item.entity),
+        amount: Math.round(numberOrNull(ev[G.damageAmount]) || 0),
+        critical: !!ev[G.damageCritical], fatal: !!ev[G.damageFatal]
+      });
+    }
+    if (damage.log.length > DAMAGE_LOG_MAX) damage.log.splice(0, damage.log.length - DAMAGE_LOG_MAX);
+    return damage.log;
   }
 
   function isNum(o, key) { return typeof o[key] === "number"; }
@@ -4362,8 +4503,44 @@
     salvo: function (c) { return isNum(c, G.salvoReloadTime) && isNum(c, G.salvoEndsAt); },
     magnum: function (c) { return isNum(c, G.magnumReloadTime) && G.magnumCharge in c; },
     idle: function (c) { return isNum(c, G.idlePeriod) && isNum(c, G.idleElapsed) && isNum(c, G.idleWarnAt) && typeof c[G.idlePaused] === "boolean"; },
-    weapon: function (c) { return G.weaponKind in c; }
+    weapon: function (c) { return G.weaponKind in c; },
+    overdrive: function (c) {
+      return typeof c[G.overdriveInit] === "function" && isNum(c, G.overdriveCharge) && !!c[G.overdriveLocks] && isNum(c[G.overdriveLocks], G.lockBits);
+    },
+    supplies: function (c) {
+      return !!c[G.supplySlots] && typeof c[G.supplyActivate] === "function" && typeof c[G.supplyRelease] === "function";
+    },
+    grenade: function (c) {
+      return isNum(c, G.grenadePointCount) && typeof c[G.grenadeShown] === "boolean" && !!c[G.grenadeHit] &&
+        !!c[G.grenadeMark] && typeof c[G.grenadeMark][G.isVisible] === "function" && !!c[G.grenadeStart];
+    }
   };
+
+  var GRENADE_MAX_POINTS = 1000;
+
+  function grenadeAimState(now) {
+    var p = localTankParts(now), g = p && p.grenade;
+    if (!g || !g[G.grenadeShown] || !(g[G.grenadePointCount] > 0)) return null;
+    var pts = [], n = Math.min(g[G.grenadePointCount] | 0, GRENADE_MAX_POINTS), list = g[G.grenadePoints], i, it, v;
+    v = vecToM(parseMapVec(g[G.grenadeStart]));
+    if (v) pts.push(v);
+    for (i = 0; i < n; i++) {
+      it = null;
+      try { it = list[G.get](i); } catch (e) { break; }
+      v = it && vecToM(parseMapVec(it[G.aimPointPosition]));
+      if (v) pts.push(v);
+    }
+    var land = null;
+    try { if (g[G.grenadeMark][G.isVisible]()) land = vecToM(parseMapVec(g[G.grenadeHit][G.hitPoint])); } catch (e2) {}
+    return { pts: pts.map(function (q) { return [q.x, q.y]; }), land: land ? [land.x, land.y] : null };
+  }
+
+  function isPaused() {
+    try {
+      var state = uiState(), pause = state && state[G.pauseState];
+      return !!(pause && pause[G.pauseActive] === true);
+    } catch (e) { return false; }
+  }
 
   var tankParts = { entity: null, parts: null, at: 0 };
 
@@ -4396,6 +4573,48 @@
     return { left: (1 - progress) * total, total: total };
   }
 
+  function effectLeft(cooldowns, type, now) {
+    var times = cooldowns && kotlinMapGet(cooldowns[G.cooldownTimes], type);
+    var end = times && numberOrNull(times[G.effectEnd]);
+    return end == null || now == null ? 0 : Math.max(0, end - now);
+  }
+
+  function supplyTypes(slots) {
+    var byName = {};
+    kotlinMapEach(slots, function (type, slot) { byName[enumStr(type)] = { type: type, slot: slot }; });
+    return byName;
+  }
+
+  function overdriveState(p, now) {
+    if (!p.overdrive) return null;
+    var charge = p.overdrive[G.overdriveCharge], full = GAME.overdriveFull, active = false;
+    var cooldowns = p.supplies && p.supplies[G.supplyCooldowns];
+    kotlinMapEach(cooldowns && cooldowns[G.cooldownTimes], function (type) {
+      if (enumStr(type) === GAME.overdriveSupply && effectLeft(cooldowns, type, now) > 0) active = true;
+    });
+    return { frac: Math.max(0, Math.min(1, charge / full)), ready: charge >= full, active: active };
+  }
+
+  function suppliesState(p, now) {
+    if (!p.supplies) return null;
+    var byName = supplyTypes(p.supplies[G.supplySlots]), cooldowns = p.supplies[G.supplyCooldowns], out = [];
+    TOC.catalog.supplies.forEach(function (entry) {
+      var found = byName[entry[0]];
+      if (!found) return;
+      var count = null, cooldown = 0;
+      try { count = numberOrNull(found.slot[G.slotCount]()); } catch (e) {}
+      try { cooldown = numberOrNull(found.slot[G.slotCooldown]()) || 0; } catch (e2) {}
+      if (entry[2] && !(count > 0)) return;
+      out.push({ name: entry[1], count: count, cooldown: cooldown, active: effectLeft(cooldowns, found.type, now) });
+    });
+    return out;
+  }
+
+  function worldSeconds() {
+    var world = battleWorld();
+    return world ? numberOrNull(world[G.worldTime]) : null;
+  }
+
   function ownKit() {
     var state = uiState(), users = state && state[G.battleUsers], me = state && state[G.session] && state[G.session][G.ownUserId];
     if (!users || me == null) return { hull: null, turret: null };
@@ -4421,6 +4640,9 @@
       info.elevationSpeed = { now: Math.abs(p.barrel[G.elevationSpeedNow]) * DEG, max: p.barrel[G.elevationSpeedMax] * DEG };
     }
     info.reload = reloadState(p);
+    var worldNow = worldSeconds();
+    info.overdrive = overdriveState(p, worldNow);
+    info.supplies = suppliesState(p, worldNow);
     if (p.idle) info.idleKick = Math.max(0, p.idle[G.idlePeriod] - p.idle[G.idleElapsed]);
     return info;
   }
@@ -4489,24 +4711,30 @@
     battleInfoSent.texts = {};
   }
 
-  function sendIfChanged(kind, payload) {
+  function sendIfChanged(key, kind, payload) {
     var text = JSON.stringify(payload);
-    if (battleInfoSent.texts[kind] === text) return;
-    battleInfoSent.texts[kind] = text;
+    if (battleInfoSent.texts[key] === text) return;
+    battleInfoSent.texts[key] = text;
     toBridge(kind, payload);
   }
 
   function publishBattleInfo(now) {
     if (now < battleInfoSent.nextAt) return;
     battleInfoSent.nextAt = now + BATTLE_INFO_INTERVAL_MS;
+    var vm = TOC.viewModel;
     if (battleInfoSent.battleId !== battle.id) {
       resendBattleInfo();
       battleInfoSent.battleId = battle.id;
-      toBridge("battle", { id: battle.id, session: PAGE_SESSION });
+      toBridge("tabs", { tabs: vm.tabs });
+      toBridge("session", { id: PAGE_SESSION + ":" + battle.id });
     }
-    try { sendIfChanged("chat", { messages: chatMessages() }); } catch (eC) {}
-    try { sendIfChanged("kills", { kills: killFeed() }); } catch (eK) {}
-    try { sendIfChanged("players", { teams: playerTeams() }); } catch (eP) {}
+    try { sendIfChanged("chat", "feed", { id: "chat", entries: vm.chatFeed(chatMessages()) }); } catch (eC) {}
+    try { sendIfChanged("log", "feed", { id: "log", entries: vm.logFeed(killFeed()) }); } catch (eK) {}
+    try { sendIfChanged("players", "tables", { id: "players", tables: vm.playerTables(playerTeams()), empty: vm.playersEmpty }); } catch (eP) {}
+    try {
+      var hits = damageLog();
+      sendIfChanged("damage", "feed", { id: "damage", entries: vm.damageFeed(hits), empty: vm.damageEmpty(damageStats()) });
+    } catch (eD) {}
   }
 
   function stepParkourCamera(factor) {
@@ -4538,9 +4766,13 @@
     (document.activeElement || document.body || document).dispatchEvent(ev);
   }
 
+  var CONTROLS = {
+    camera: function (step) { stepParkourCamera(step > 0 ? 1.15 : 1 / 1.15); },
+    bushes: function (on) { setBushesHidden(!!on); }
+  };
+
   function runCommand(command) {
-    if (command.name === "camera") stepParkourCamera(Number(command.factor) || 1);
-    else if (command.name === "bushes") setBushesHidden(!!command.hide);
+    if (command.name === "control" && CONTROLS[command.id]) CONTROLS[command.id](command.value);
     else if (command.name === "key") pressKey(command);
   }
 

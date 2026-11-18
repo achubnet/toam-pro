@@ -2,53 +2,42 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <title>TO Coords</title>
+  <title>Карта</title>
   <link rel="stylesheet" href="window.css">
 </head>
 <body>
   <nav id="tabs">
     <button data-tab="map">Карта</button>
-    <button data-tab="chat">Чат <span class="badge" data-badge="chat"></span></button>
-    <button data-tab="players">Игроки</button>
-    <button data-tab="kills">Убийства <span class="badge" data-badge="kills"></span></button>
   </nav>
-  <main>
+  <main id="pages">
     <section class="tab" data-tab="map">
       <canvas id="map"></canvas>
-      <div id="tank-info" hidden></div>
+      <div id="info" hidden></div>
+      <div id="banner" hidden><strong></strong><span></span></div>
     </section>
-    <section class="tab list" data-tab="chat"><ol id="chat"></ol></section>
-    <section class="tab list" data-tab="players"><div id="players"></div></section>
-    <section class="tab list" data-tab="kills"><ol id="kills"></ol></section>
   </main>
   <footer id="panel">
     <div class="group">
       <span class="label">Карта</span>
-      <button data-action="map-out" title="Отдалить карту">−</button>
-      <button data-action="map-in" title="Приблизить карту">+</button>
+      <button data-zoom="0.8" title="Отдалить">−</button>
+      <button data-zoom="1.25" title="Приблизить">+</button>
     </div>
-    <label class="switch" title="Карта поворачивается за дулом: всё, что впереди, — сверху"><input type="checkbox" data-switch="rotate"><span>Прикрепить камеру</span></label>
-    <label class="switch" title="Стрелка выше или ниже тебя возле каждого танка"><input type="checkbox" data-switch="heights"><span>Высота</span></label>
-    <label class="switch" title="Танки под потолком полупрозрачные"><input type="checkbox" data-switch="roofs"><span>Под крышей</span></label>
-    <label class="switch"><input type="checkbox" data-switch="health"><span>Здоровье</span></label>
-    <label class="switch"><input type="checkbox" data-switch="tank"><span>Танк</span></label>
-    <div class="group">
-      <span class="label">Камера</span>
-      <button data-action="camera-closer" data-parkour-only title="Камера ближе">−</button>
-      <button data-action="camera-farther" data-parkour-only title="Камера дальше">+</button>
-    </div>
-    <label class="switch"><input type="checkbox" data-switch="bushes" data-parkour-only><span>Скрыть кусты</span></label>
-    <label class="switch" title="Клавиши из этого окна идут в игру"><input type="checkbox" data-switch="control"><span>Управление</span></label>
-    <div id="info"></div>
+    <label class="switch" title="Карта поворачивается за направлением прицела: всё, что впереди, — сверху"><input type="checkbox" data-view="rotate"><span>Прикрепить камеру</span></label>
+    <label class="switch" title="Стрелка выше или ниже тебя возле каждой метки"><input type="checkbox" data-view="heights"><span>Высота</span></label>
+    <label class="switch" title="Метки под перекрытием полупрозрачные"><input type="checkbox" data-view="roofs"><span>Под крышей</span></label>
+    <label class="switch"><input type="checkbox" data-view="health"><span>Здоровье</span></label>
+    <label class="switch"><input type="checkbox" data-view="info"><span>Инфо</span></label>
+    <div id="controls"></div>
+    <label class="switch" title="Нажатия клавиш в этом окне передаются дальше"><input type="checkbox" data-view="keys"><span>Управление</span></label>
+    <div id="summary"></div>
     <div id="status"></div>
   </footer>
   <script src="../shared/map-geometry.js"></script>
   <script src="map-layers.js"></script>
   <script src="map-renderer.js"></script>
-  <script src="tank-view.js"></script>
-  <script src="chat-view.js"></script>
-  <script src="players-view.js"></script>
-  <script src="kills-view.js"></script>
+  <script src="info-view.js"></script>
+  <script src="feed-view.js"></script>
+  <script src="table-view.js"></script>
   <script src="window.js"></script>
 </body>
 </html>

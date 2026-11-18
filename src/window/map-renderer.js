@@ -1,21 +1,20 @@
 /*
  * frame = {
- *   me: { x, y, z, heading, hp } | null,         hp: { now, max } | null
- *   ray: { dx, dy, dist } | null,
- *   tanks: [{ x, y, z, side, hd, hp }],            side: ally | enemy | unknown, hd: {x, y} | null
- *   carriers: [{ x, y, z, side, flagSide, hd, hp }],
- *   bases: [{ x, y, side, taken }],                side: ally | enemy | red | blue | neutral
- *   dropped: [{ x, y, side }],
- *   cps: [{ x, y, letter, live, owner, ring, frac, active }],
- *   aim: { pts: [[x, y], ...], land: [x, y] | null } | null
+ *   self: { x, y, z, heading, aim: { dx, dy, dist }, hp, dead } | null,   hp: { now, max } | null
+ *   units: [{ x, y, z, side, dir: { x, y } | null, hp, carrying }],      carrying: side of a carried flag
+ *   flags: [{ x, y, side, state }],                                       state: home | taken | loose
+ *   points: [{ x, y, label, live, owner, progressSide, progress, active }],
+ *   marks: [{ x, y, side, icon }],                                        icon: skull
+ *   paths: [{ pts: [[x, y], ...], end: [x, y] | null, color }]
  * }
+ * side: ally | enemy | red | blue | neutral | unknown
  * view = { zoom, follow, drive, health, heights, roofs, rotate }
  */
 (function (root) {
   "use strict";
 
-  var layers = root.TOC.layers;
-  var isFiniteNum = root.TOC.geometry.isFiniteNum;
+  var layers = root.View.layers;
+  var isFiniteNum = root.MapGeometry.isFiniteNum;
 
   var SIDE = {
     ally: "#1e6bff", enemy: "#ff2a2a", red: "#ff2a2a", blue: "#1e6bff",
@@ -92,37 +91,87 @@
     return "#ff6b5a";
   }
 
+  var HEALTH_BAR_W = 22;
+
   function drawHealth(ctx, x, y, hp) {
     if (!hp || !isFiniteNum(hp.now)) return;
+    var frac = hp.max > 0 ? Math.max(0, Math.min(1, hp.now / hp.max)) : 1, color = healthColor(frac);
     ctx.save();
-    ctx.font = "bold 10px ui-sans-serif, system-ui, sans-serif";
+    ctx.font = "bold 9px ui-sans-serif, system-ui, sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.lineJoin = "round";
     ctx.lineWidth = 3;
     ctx.strokeStyle = "rgba(0,0,0,0.9)";
     ctx.strokeText(String(hp.now), x, y);
-    ctx.fillStyle = healthColor(hp.max > 0 ? hp.now / hp.max : 1);
+    ctx.fillStyle = color;
     ctx.fillText(String(hp.now), x, y);
+    ctx.fillStyle = "rgba(0,0,0,0.85)";
+    ctx.fillRect(x - 1, y + 5, HEALTH_BAR_W + 2, 5);
+    ctx.fillStyle = "#3a3f44";
+    ctx.fillRect(x, y + 6, HEALTH_BAR_W, 3);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y + 6, Math.round(HEALTH_BAR_W * frac), 3);
     ctx.restore();
+  }
+
+  function drawSkull(ctx, x, y, color) {
+    ctx.save();
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y - 2, 6.5, Math.PI * 0.85, Math.PI * 2.15);
+    ctx.lineTo(x + 4, y + 3);
+    ctx.lineTo(x + 4, y + 6.5);
+    ctx.lineTo(x - 4, y + 6.5);
+    ctx.lineTo(x - 4, y + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "rgba(0,0,0,0.9)";
+    ctx.beginPath();
+    ctx.arc(x - 2.5, y - 1.5, 1.9, 0, Math.PI * 2);
+    ctx.arc(x + 2.5, y - 1.5, 1.9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x, y + 0.8);
+    ctx.lineTo(x - 1, y + 2.6);
+    ctx.lineTo(x + 1, y + 2.6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillRect(x - 1.6, y + 4, 0.9, 2.5);
+    ctx.fillRect(x + 0.7, y + 4, 0.9, 2.5);
+    ctx.restore();
+  }
+
+  var MARK_ICONS = { skull: drawSkull };
+
+  function drawMarks(ctx, vt, W, H, marks) {
+    for (var i = 0; i < (marks || []).length; i++) {
+      var m = marks[i], draw = MARK_ICONS[m.icon], p = vt.toScreen(m.x, m.y);
+      if (!draw || offView(p, W, H, 10)) continue;
+      draw(ctx, p.x, p.y, sideColor(m.side, SIDE.unknown));
+    }
   }
 
   function offView(p, W, H, m) {
     return p.x < -m || p.y < -m || p.x > W + m || p.y > H + m;
   }
 
-  function baseColor(side) {
+  function flagColor(side) {
     return side === "neutral" || !SIDE[side] ? "#c9c14a" : SIDE[side];
   }
 
-  function drawBases(ctx, toScreen, W, H, bases) {
+  function drawFlags(ctx, toScreen, W, H, flags) {
     var i, o, p, blinkOn = (Date.now() / 180) % 2 < 1;
-    for (i = 0; i < (bases || []).length; i++) {
-      o = bases[i];
+    for (i = 0; i < (flags || []).length; i++) {
+      o = flags[i];
       p = toScreen(o.x, o.y);
       if (offView(p, W, H, 24)) continue;
       ctx.save();
-      if (o.taken) {
+      if (o.state === "taken") {
         ctx.globalAlpha = blinkOn ? 1 : 0.28;
         ctx.strokeStyle = "#fff";
         ctx.lineWidth = 1.25;
@@ -130,12 +179,12 @@
         ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
         ctx.stroke();
       }
-      drawFlagIcon(ctx, p.x - 4, p.y + 8, baseColor(o.side), 1, "#ffffff");
+      drawFlagIcon(ctx, p.x - 4, p.y + 8, flagColor(o.side), 1, o.state === "loose" ? "#ffd400" : "#ffffff");
       ctx.restore();
     }
   }
 
-  function drawCp(ctx, p, c) {
+  function drawPoint(ctx, p, c) {
     var TAU = Math.PI * 2;
     if (!c.live) {
       ctx.beginPath();
@@ -146,10 +195,10 @@
       ctx.fill();
       ctx.stroke();
       ctx.fillStyle = "#ffe56a";
-      ctx.fillText(c.letter || "?", p.x, p.y + 0.5);
+      ctx.fillText(c.label || "?", p.x, p.y + 0.5);
       return;
     }
-    var r = 9, ring = r + 4.5, frac = Math.max(0, Math.min(1, c.frac || 0));
+    var r = 9, ring = r + 4.5, frac = Math.max(0, Math.min(1, c.progress || 0));
     ctx.globalAlpha = c.active === false ? 0.45 : 1;
     ctx.beginPath();
     ctx.arc(p.x, p.y, ring, 0, TAU);
@@ -159,7 +208,7 @@
     if (frac > 0.005) {
       ctx.beginPath();
       ctx.arc(p.x, p.y, ring, -Math.PI / 2, -Math.PI / 2 + frac * TAU);
-      ctx.strokeStyle = sideColor(c.ring, SIDE.neutral);
+      ctx.strokeStyle = sideColor(c.progressSide, SIDE.neutral);
       ctx.lineWidth = 3.5;
       ctx.stroke();
     }
@@ -171,27 +220,21 @@
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.fillStyle = "#ffffff";
-    ctx.fillText(c.letter || "?", p.x, p.y + 0.5);
+    ctx.fillText(c.label || "?", p.x, p.y + 0.5);
     ctx.globalAlpha = 1;
   }
 
   function drawObjectives(ctx, toScreen, W, H, f) {
-    var i, p, d;
+    var i, p;
     ctx.save();
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.font = "bold 11px ui-sans-serif, system-ui, sans-serif";
-    drawBases(ctx, toScreen, W, H, f.bases);
-    for (i = 0; i < (f.cps || []).length; i++) {
-      p = toScreen(f.cps[i].x, f.cps[i].y);
+    drawFlags(ctx, toScreen, W, H, f.flags);
+    for (i = 0; i < (f.points || []).length; i++) {
+      p = toScreen(f.points[i].x, f.points[i].y);
       if (offView(p, W, H, 20)) continue;
-      drawCp(ctx, p, f.cps[i]);
-    }
-    for (i = 0; i < (f.dropped || []).length; i++) {
-      d = f.dropped[i];
-      p = toScreen(d.x, d.y);
-      if (offView(p, W, H, 20)) continue;
-      drawFlagIcon(ctx, p.x - 4, p.y + 8, sideColor(d.side, SIDE.neutral), 1, "#ffd400");
+      drawPoint(ctx, p, f.points[i]);
     }
     ctx.restore();
   }
@@ -226,62 +269,45 @@
     ctx.stroke();
   }
 
-  function drawTankMarker(ctx, vt, t, p, col, k) {
-    if (t.hd) {
-      var d = vt.dir(t.hd.x, t.hd.y);
+  function drawUnitMarker(ctx, vt, u, p, col, k) {
+    if (u.dir) {
+      var d = vt.dir(u.dir.x, u.dir.y);
       drawArrow(ctx, p.x, p.y, d.x, d.y, col, "rgba(0,0,0,0.85)", k);
     } else {
       drawDot(ctx, p.x, p.y, 5 * k / 0.85, col);
     }
   }
 
-  function drawTankExtras(ctx, t, p, o) {
-    if (o.heights && o.meZ != null && isFiniteNum(t.z)) drawHeightMark(ctx, p.x, p.y, t.z - o.meZ);
-    if (o.health) drawHealth(ctx, p.x + 9, p.y + 8, t.hp);
-  }
-
-  function drawTanks(ctx, vt, W, H, tanks, o) {
-    var i, t, p;
-    ctx.save();
-    for (i = 0; i < (tanks || []).length; i++) {
-      t = tanks[i];
-      p = vt.toScreen(t.x, t.y);
-      if (offView(p, W, H, 10)) continue;
-      ctx.globalAlpha = o.covered(t) ? COVERED_ALPHA : 1;
-      drawTankMarker(ctx, vt, t, p, sideColor(t.side, SIDE.unknown), 0.85);
-      ctx.globalAlpha = 1;
-      drawTankExtras(ctx, t, p, o);
-    }
-    ctx.restore();
-  }
-
-  function drawCarriers(ctx, vt, W, H, carriers, o) {
-    var i, c, p;
-    for (i = 0; i < (carriers || []).length; i++) {
-      c = carriers[i];
-      p = vt.toScreen(c.x, c.y);
+  function drawUnits(ctx, vt, W, H, units, o) {
+    var i, u, p;
+    for (i = 0; i < (units || []).length; i++) {
+      u = units[i];
+      p = vt.toScreen(u.x, u.y);
       if (offView(p, W, H, 30)) continue;
       ctx.save();
-      ctx.globalAlpha = o.covered(c) ? COVERED_ALPHA : 1;
-      drawTankMarker(ctx, vt, c, p, sideColor(c.side, SIDE.unknown), 0.95);
+      ctx.globalAlpha = o.covered(u) ? COVERED_ALPHA : 1;
+      drawUnitMarker(ctx, vt, u, p, sideColor(u.side, SIDE.unknown), u.carrying ? 0.95 : 0.85);
       ctx.restore();
-      drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(c.flagSide, SIDE.neutral));
-      drawTankExtras(ctx, c, p, o);
+      if (u.carrying) drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(u.carrying, SIDE.neutral));
+      if (o.heights && o.selfZ != null && isFiniteNum(u.z)) drawHeightMark(ctx, p.x, p.y, u.z - o.selfZ);
+      if (o.health) drawHealth(ctx, p.x + 9, p.y + 8, u.hp);
     }
   }
 
-  function drawSelf(ctx, vt, f, me, W, H, viewM, o) {
-    var p = vt.toScreen(me.x, me.y);
+  function drawSelf(ctx, vt, self, W, H, viewM, o) {
+    var p = vt.toScreen(self.x, self.y);
     ctx.save();
-    ctx.globalAlpha = o.covered(me) ? COVERED_ALPHA : 1;
-    if (!isFiniteNum(me.heading)) {
+    ctx.globalAlpha = o.covered(self) ? COVERED_ALPHA : 1;
+    if (self.dead) {
+      drawSkull(ctx, p.x, p.y, "#ffffff");
+    } else if (!isFiniteNum(self.heading)) {
       drawDot(ctx, p.x, p.y, 6, "#ffffff");
     } else {
-      var hx = Math.cos(me.heading), hy = Math.sin(me.heading), ray = f.ray || {};
-      var yawX = isFiniteNum(ray.dx) ? ray.dx : hx, yawY = isFiniteNum(ray.dy) ? ray.dy : hy;
-      var len = Math.sqrt(yawX * yawX + yawY * yawY) || 1;
-      var rayM = isFiniteNum(ray.dist) && ray.dist > 0 ? ray.dist : Math.sqrt(W * W + H * H) / 2 / viewM;
-      var end = vt.toScreen(me.x + yawX / len * rayM, me.y + yawY / len * rayM);
+      var hx = Math.cos(self.heading), hy = Math.sin(self.heading), aim = self.aim || {};
+      var ax = isFiniteNum(aim.dx) ? aim.dx : hx, ay = isFiniteNum(aim.dy) ? aim.dy : hy;
+      var len = Math.sqrt(ax * ax + ay * ay) || 1;
+      var reach = isFiniteNum(aim.dist) && aim.dist > 0 ? aim.dist : Math.sqrt(W * W + H * H) / 2 / viewM;
+      var end = vt.toScreen(self.x + ax / len * reach, self.y + ay / len * reach);
       ctx.strokeStyle = "#ffcc33";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -292,7 +318,7 @@
       drawSelfArrow(ctx, p.x, p.y, d.x, d.y);
     }
     ctx.restore();
-    if (o.health) drawHealth(ctx, p.x + 11, p.y + 10, me.hp);
+    if (o.health && !self.dead) drawHealth(ctx, p.x + 11, p.y + 8, self.hp);
   }
 
   function drawNorth(ctx, vt, W) {
@@ -311,24 +337,24 @@
     ctx.restore();
   }
 
-  function drawAim(ctx, toScreen, aim) {
-    if (!aim) return;
-    var i, p, pts = aim.pts || [];
+  function drawPath(ctx, toScreen, path) {
+    if (!path) return;
+    var i, p, pts = path.pts || [], color = path.color || "#ffb000";
     ctx.save();
-    ctx.fillStyle = "#ffb000";
+    ctx.fillStyle = color;
     for (i = 0; i < pts.length; i++) {
       p = toScreen(pts[i][0], pts[i][1]);
       ctx.beginPath();
       ctx.arc(p.x, p.y, 1.6, 0, Math.PI * 2);
       ctx.fill();
     }
-    if (aim.land) {
-      p = toScreen(aim.land[0], aim.land[1]);
+    if (path.end) {
+      p = toScreen(path.end[0], path.end[1]);
       ctx.lineWidth = 4;
       ctx.strokeStyle = "rgba(0,0,0,0.8)";
       ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
       ctx.lineWidth = 2;
-      ctx.strokeStyle = "#ffb000";
+      ctx.strokeStyle = color;
       ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
       ctx.beginPath();
       ctx.moveTo(p.x - 12, p.y); ctx.lineTo(p.x - 4, p.y);
@@ -340,17 +366,17 @@
     ctx.restore();
   }
 
-  function facingAngle(f, me) {
-    var ray = f.ray || {};
-    if (isFiniteNum(ray.dx) && isFiniteNum(ray.dy) && (ray.dx || ray.dy)) return Math.atan2(ray.dy, ray.dx);
-    return isFiniteNum(me.heading) ? me.heading : null;
+  function facingAngle(self) {
+    var aim = self.aim || {};
+    if (isFiniteNum(aim.dx) && isFiniteNum(aim.dy) && (aim.dx || aim.dy)) return Math.atan2(aim.dy, aim.dx);
+    return isFiniteNum(self.heading) ? self.heading : null;
   }
 
-  function drawPicture(ctx, L, view, me, W, H, cx, cy, viewM, rot) {
+  function drawPicture(ctx, L, view, self, W, H, cx, cy, viewM, rot) {
     var b = L.bounds, k = viewM / b.scale, c = layers.worldToPicture(cx, cy, b);
     var reach = Math.sqrt(W * W + H * H) / 2 / k;
-    var tankZ = me && isFiniteNum(me.z) ? me.z : null;
-    var onHigh = tankZ != null && tankZ >= (L.splitZ || 2.4) - 0.35;
+    var selfZ = self && isFiniteNum(self.z) ? self.z : null;
+    var onHigh = selfZ != null && selfZ >= (L.splitZ || 2.4) - 0.35;
     function blit(img, alpha) {
       if (!img) return;
       var x0 = Math.max(0, c.x - reach), y0 = Math.max(0, c.y - reach);
@@ -375,7 +401,7 @@
     }
     blit(L.outlines, 1);
     ctx.restore();
-    return onHigh ? "верх" : (tankZ == null ? "" : "низ");
+    return onHigh ? "верх" : (selfZ == null ? "" : "низ");
   }
 
   function drawScaleBar(ctx, W, H, viewM) {
@@ -398,7 +424,7 @@
   function drawFrame(canvas, f, view, L) {
     var ctx = canvas.getContext("2d");
     var W = canvas.width, H = canvas.height;
-    var me = f.me && isFiniteNum(f.me.x) ? f.me : null;
+    var self = f.self && isFiniteNum(f.self.x) ? f.self : null;
     var b = L && L.offscreen && L.bounds, viewM = 1, cx = 0, cy = 0, rot = 0, levelLabel = "";
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
@@ -407,14 +433,14 @@
     if (b) {
       var zoom = Math.max(0.25, view.zoom || 1);
       viewM = Math.min(W / (b.xmax - b.xmin), H / (b.ymax - b.ymin)) * zoom;
-      var follow = me && (view.rotate || (view.follow !== false && zoom > 1.001));
-      cx = follow ? me.x : (b.xmin + b.xmax) / 2;
-      cy = follow ? me.y : (b.ymin + b.ymax) / 2;
-      if (view.rotate && me) {
-        var facing = facingAngle(f, me);
+      var follow = self && (view.rotate || (view.follow !== false && zoom > 1.001));
+      cx = follow ? self.x : (b.xmin + b.xmax) / 2;
+      cy = follow ? self.y : (b.ymin + b.ymax) / 2;
+      if (view.rotate && self) {
+        var facing = facingAngle(self);
         if (facing != null) rot = Math.PI / 2 - facing;
       }
-      try { levelLabel = drawPicture(ctx, L, view, me, W, H, cx, cy, viewM, rot); } catch (eP) {}
+      try { levelLabel = drawPicture(ctx, L, view, self, W, H, cx, cy, viewM, rot); } catch (eP) {}
     }
     var cosR = Math.cos(rot), sinR = Math.sin(rot);
     var vt = {
@@ -429,16 +455,18 @@
     };
     var roofs = view.roofs && L && L.roofs;
     var opts = {
-      meZ: me && isFiniteNum(me.z) ? me.z : null,
+      selfZ: self && isFiniteNum(self.z) ? self.z : null,
       heights: !!view.heights,
       health: !!view.health,
       covered: function (o) { return !!roofs && layers.roofAbove(roofs, o.x, o.y, o.z); }
     };
     try { drawObjectives(ctx, vt.toScreen, W, H, f); } catch (eObj) {}
-    try { drawTanks(ctx, vt, W, H, f.tanks, opts); } catch (eT) {}
-    try { drawCarriers(ctx, vt, W, H, f.carriers, opts); } catch (eC) {}
-    try { drawAim(ctx, vt.toScreen, f.aim); } catch (eA) {}
-    if (me) try { drawSelf(ctx, vt, f, me, W, H, viewM, opts); } catch (eSelf) {}
+    try { drawMarks(ctx, vt, W, H, f.marks); } catch (eM) {}
+    try { drawUnits(ctx, vt, W, H, f.units, opts); } catch (eU) {}
+    (f.paths || []).forEach(function (path) {
+      try { drawPath(ctx, vt.toScreen, path); } catch (eP) {}
+    });
+    if (self) try { drawSelf(ctx, vt, self, W, H, viewM, opts); } catch (eSelf) {}
     if (b) drawScaleBar(ctx, W, H, viewM);
     if (rot) drawNorth(ctx, vt, W);
     if (levelLabel) {
@@ -452,10 +480,10 @@
   function createRenderer() {
     var picture = null, mapId = null;
     return {
-      setMap: function (id, data, orientation, log) {
+      setMap: function (id, data, options, log) {
         if (!data || !data.collision) return false;
         if (picture && mapId === id) return true;
-        layers.setOrientation(orientation);
+        layers.configure(options);
         var built = null;
         try { built = layers.build(data, log); } catch (e) { if (log) log("map build error: " + (e && e.message || e)); }
         if (!built) return false;
@@ -471,5 +499,5 @@
     };
   }
 
-  root.TOC.renderer = { create: createRenderer };
+  root.View.renderer = { create: createRenderer };
 })(window);

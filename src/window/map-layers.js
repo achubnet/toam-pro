@@ -1,16 +1,20 @@
 (function (root) {
   "use strict";
 
-  var geometry = root.TOC.geometry;
+  var geometry = root.MapGeometry;
   var isFiniteNum = geometry.isFiniteNum;
   var rotateEuler = geometry.rotateEuler;
   var collectBounds = geometry.collectBounds;
   var COS35 = Math.cos(35 * Math.PI / 180);
-  var TANK_WIDTH_M = 3.5;
+  var UNIT_WIDTH_M = 3;
+  var HIDDEN_BOXES = null;
   var ORIENT = { flipX: false, flipY: false, rotate: 0 };
 
-  function setOrientation(o) {
+  function configure(options) {
+    var o = (options && options.orientation) || null;
     ORIENT = { flipX: !!(o && o.flipX), flipY: !!(o && o.flipY), rotate: (o && Number(o.rotate)) || 0 };
+    UNIT_WIDTH_M = (options && options.unitWidth) || 3;
+    HIDDEN_BOXES = options && options.hiddenBoxes ? new RegExp(options.hiddenBoxes, "i") : null;
   }
 
   function heightFill(z, zmin, zmax) {
@@ -61,9 +65,8 @@
     return out;
   }
 
-  function helperBoxName(name) {
-    if (!name || typeof name !== "string") return false;
-    return /grenade|aiming|foam|smoke/i.test(name);
+  function isHiddenBox(name) {
+    return !!HIDDEN_BOXES && typeof name === "string" && HIDDEN_BOXES.test(name);
   }
 
   function convexHullXY(points) {
@@ -105,7 +108,7 @@
   }
 
   function classifyMapBox(box) {
-    if (helperBoxName(box && box.name)) return "skip";
+    if (isHiddenBox(box && box.name)) return "skip";
     var sz = box && box.size;
     if (!sz) return "skip";
     var dims = [Math.abs(sz.x || 0), Math.abs(sz.y || 0), Math.abs(sz.z || 0)];
@@ -410,7 +413,7 @@
       fillPoly(convexHullXY(tall[i].corners), true);
     }
 
-    var rad = Math.ceil((TANK_WIDTH_M / 2) / cell);
+    var rad = Math.ceil((UNIT_WIDTH_M / 2) / cell);
     var blocked2 = new Uint8Array(n);
     blocked2.set(blocked);
     var ix, iy, dx, dy, jx, jy;
@@ -762,5 +765,6 @@
     };
   }
 
-  root.TOC.layers = { build: buildMapLayers, worldToPicture: mapWorldToOff, setOrientation: setOrientation, roofAbove: roofAbove };
+  root.View = root.View || {};
+  root.View.layers = { build: buildMapLayers, worldToPicture: mapWorldToOff, configure: configure, roofAbove: roofAbove };
 })(window);

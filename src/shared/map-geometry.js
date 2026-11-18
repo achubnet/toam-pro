@@ -60,6 +60,5 @@
     return { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } };
   }
 
-  root.TOC = root.TOC || {};
-  root.TOC.geometry = { rotateEuler: rotateEuler, add3: add3, collectBounds: collectBounds, isFiniteNum: isFiniteNum };
+  root.MapGeometry = { rotateEuler: rotateEuler, add3: add3, collectBounds: collectBounds, isFiniteNum: isFiniteNum };
 })(window);

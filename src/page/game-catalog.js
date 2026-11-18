@@ -32,6 +32,11 @@
     Terminator: "Терминатор", Tesla: "Тесла", Thunder: "Гром", Twins: "Твинс", Tsunami: "Цунами"
   };
 
+  var supplies = [
+    ["FIRST_AID", "Аптечка"], ["DOUBLE_ARMOR", "Броня"], ["DOUBLE_DAMAGE", "Урон"], ["NITRO", "Нитро"],
+    ["MINE", "Мина"], ["GRENADE", "Граната"], ["GOLD_BOX", "Голд", true], ["NUCLEAR", "Ядерка", true]
+  ];
+
   root.TOC = root.TOC || {};
-  root.TOC.catalog = { turrets: turrets, hulls: hulls, damage: damage, weaponKinds: weaponKinds };
+  root.TOC.catalog = { turrets: turrets, hulls: hulls, damage: damage, weaponKinds: weaponKinds, supplies: supplies };
 })(window);

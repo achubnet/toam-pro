@@ -28,7 +28,21 @@
     bodyOwner: "b9i_1", bodyShapes: "o9i_1", bodyMovable: "d9i_1", bodyLink: "c9i_1",
 
     // entity
-    entityComponents: "gz1_1", entityTags: "ryw_1",
+    entityComponents: "gz1_1", entityTags: "ryw_1", entitySignals: "dz1_1", subscribe: "cz6",
+    signalListeners: "jz7_1", listenerHandler: "dz8_1", tankState: "a10c_1",
+    gameModeUsers: "c10b_1", userTankEntities: "a12y_1",
+
+    // overdrive and supplies
+    overdriveCharge: "h16j_1", overdriveInit: "v16j", overdriveLocks: "k16j_1", lockBits: "o2h_1",
+    supplySlots: "v125_1", supplyActivate: "p128", supplyRelease: "x128", supplyCooldowns: "s125_1",
+    slotCount: "g44", slotCooldown: "n126", cooldownTimes: "z126_1", effectEnd: "x15f_1", worldTime: "cyw_1",
+
+    // grenade aim
+    grenadeShown: "h168_1", grenadePointCount: "r168_1", grenadePoints: "j168_1", grenadeHit: "o168_1",
+    grenadeMark: "g168_1", grenadeStart: "m168_1", grenadeCharge: "e168_1", grenadeCharging: "y169_1",
+
+    // damage event
+    damageKind: "f11o_1", damageAmount: "g11o_1", damageCritical: "h11o_1", damageFatal: "i11o_1",
 
     // health
     healthCurrent: "h12o_1", healthMax: "g12o_1", healthEvent: "f12o_1",
@@ -48,7 +62,8 @@
     spectatorMsgText: "jtk_1", systemMsgText: "ktk_1", msgAuthor: "ctk",
 
     // ui state
-    session: "opu_1", ownUserId: "iqn_1", battleUsers: "xpv_1", actionsLog: "fpw_1",
+    session: "opu_1", ownUserId: "iqn_1", battleUsers: "xpv_1", actionsLog: "fpw_1", pauseState: "bpw_1",
+    pauseActive: "iqb_1",
 
     // battle users
     onlineUsers: "yq9_1", userNames: "zq9_1", userRanks: "aqa_1", userTeams: "dqa_1", userStats: "eqa_1",
@@ -158,7 +173,12 @@
     },
     teams: { a: "TEAM_A", b: "TEAM_B" },
     relations: { ally: "ALLY", enemy: "ENEMY" },
-    entityTags: { localTank: "LocalTank" },
+    entityTags: { localTank: "LocalTank", tank: "Tank", gameMode: "GameMode" },
+    damageHandler: "showEffect",
+    damageKinds: { damage: "DAMAGE" },
+    deadStates: ["DEAD", "DEAD_PHANTOM"],
+    overdriveSupply: "ULTIMATE",
+    overdriveFull: 100,
     actionTypes: { suicide: "SUICIDE" },
     flagStates: { atBase: "AT_BASE", dropped: "DROPPED", carried: "CARRIED", away: ["DROPPED", "CARRIED", "EXILED", "FLYING"] },
     aimShowing: "StartedIndicating",

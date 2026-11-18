@@ -51,6 +51,7 @@
         "src/shared/map-geometry.js",
         "src/page/game-adapter.js",
         "src/page/game-catalog.js",
+        "src/page/view-model.js",
         "src/page/tracker.js"
       ],
       "run_at": "document_start",

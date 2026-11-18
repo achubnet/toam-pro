@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var MAP_PORT = "toc-map";
+  var MAP_PORT = "map-view";
   var mapPort = null;
 
   try {
