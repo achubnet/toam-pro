@@ -6,6 +6,9 @@
  *   points: [{ x, y, label, live, owner, progressSide, progress, active }],
  *   marks: [{ x, y, side, icon, alpha }],                                 icon: hazard | skull
  *   paths: [{ pts: [[x, y], ...], end: [x, y] | null, color }]
+ *   shells: [{ pts: [[x, y, ms], ...], firedAt, color }],                my Magnum shells in flight
+ *   boxes: [{ x, y, z, type, falling }],                                  supply boxes (see map-hud.js)
+ *   pops: [{ text, style, at }], supplies: [{ id, count, cooldown, active }]   see map-hud.js
  * }
  * side: ally | enemy | red | blue | neutral | unknown
  * view = { zoom, follow, drive, health, heights, roofs, rotate }
@@ -14,6 +17,7 @@
   "use strict";
 
   var layers = root.View.layers;
+  var hud = root.View.hud;
   var isFiniteNum = root.MapGeometry.isFiniteNum;
 
   var SIDE = {
@@ -301,17 +305,28 @@
   function drawHazard(ctx, x, y, color) {
     ctx.save();
     ctx.beginPath();
-    ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.strokeStyle = "rgba(0,0,0,0.9)";
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.2;
     ctx.fill();
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+    ctx.arc(x, y, 1.2, 0, Math.PI * 2);
     ctx.fillStyle = "rgba(255,255,255,0.85)";
     ctx.fill();
     ctx.restore();
+  }
+
+  function drawBoxes(ctx, vt, W, H, boxes, o) {
+    for (var i = 0; i < (boxes || []).length; i++) {
+      var b = boxes[i], p = vt.toScreen(b.x, b.y);
+      if (offView(p, W, H, 20)) continue;
+      ctx.save();
+      ctx.globalAlpha = !b.falling && o.covered(b) ? COVERED_ALPHA : 1;
+      hud.drawBox(ctx, p.x, p.y, b);
+      ctx.restore();
+    }
   }
 
   var MARK_ICONS = { skull: drawSkull, hazard: drawHazard };
@@ -665,14 +680,17 @@
     ctx.fillText(barM + " м", bx, by - 5);
   }
 
-  function drawFrame(canvas, f, view, L, motion) {
+  // state: what the renderer keeps between draws (motion prediction, supply timers).
+  // ratio: device pixels per CSS pixel; everything is laid out in CSS pixels.
+  function drawFrame(canvas, f, view, L, state, ratio) {
+    var motion = state.motion, k = ratio > 0 ? ratio : 1;
     var ctx = canvas.getContext("2d");
-    var W = canvas.width, H = canvas.height;
+    var W = canvas.width / k, H = canvas.height / k;
     var self = f.self && isFiniteNum(f.self.x) ? f.self : null;
     var pred = self && motion ? predictMotion(motion, self, f.time, Date.now()) : null;
     if (pred) self = movedTo(self, pred.x, pred.y);
     var b = L && L.offscreen && L.bounds, viewM = 1, cx = 0, cy = 0, rot = 0, levelLabel = "";
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.setTransform(k, 0, 0, k, 0, 0);
     ctx.globalAlpha = 1;
     ctx.fillStyle = "#141412";
     ctx.fillRect(0, 0, W, H);
@@ -710,6 +728,7 @@
     };
     try { drawObjectives(ctx, vt.toScreen, W, H, f); } catch (eObj) {}
     try { drawMarks(ctx, vt, W, H, f.marks, false); } catch (eM) {}
+    try { drawBoxes(ctx, vt, W, H, f.boxes, opts); } catch (eBx) {}
     try { drawUnits(ctx, vt, W, H, f.units, opts); } catch (eU) {}
     try { drawMarks(ctx, vt, W, H, f.marks, true); } catch (eMT) {}
     (f.paths || []).forEach(function (path) {
@@ -722,16 +741,19 @@
     if (self) try { drawSelf(ctx, vt, self, W, H, viewM, opts); } catch (eSelf) {}
     if (b) drawScaleBar(ctx, W, H, viewM);
     if (rot) drawNorth(ctx, vt, W);
+    var popping = false, hudNow = Date.now();
+    try { popping = hud.drawPops(ctx, W, f.pops, hudNow, rot ? 40 : 10); } catch (ePop) { popping = false; }
+    try { hud.drawSupplies(ctx, W, H - (levelLabel ? 20 : 8), f.supplies, state.supplies); } catch (eSup) {}
     if (levelLabel) {
       ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
       ctx.fillStyle = "#e8edf2";
       ctx.fillText("этаж: " + levelLabel, W - 70, H - 8);
     }
-    return { levelLabel: levelLabel, moving: !!(pred && pred.moving) || shellFlying };
+    return { levelLabel: levelLabel, moving: !!(pred && pred.moving) || shellFlying || popping };
   }
 
   function createRenderer() {
-    var picture = null, mapId = null, motion = createMotion();
+    var picture = null, mapId = null, state = { motion: createMotion(), supplies: hud.createSupplyTimers() };
     return {
       setMap: function (id, data, options, log) {
         if (!data || !data.collision) return false;
@@ -744,10 +766,10 @@
         mapId = id;
         return true;
       },
-      clear: function () { picture = null; mapId = null; motion = createMotion(); },
+      clear: function () { picture = null; mapId = null; state = { motion: createMotion(), supplies: hud.createSupplyTimers() }; },
       mapId: function () { return mapId; },
-      draw: function (canvas, frame, view) {
-        return drawFrame(canvas, frame || {}, view || {}, picture, motion);
+      draw: function (canvas, frame, view, ratio) {
+        return drawFrame(canvas, frame || {}, view || {}, picture, state, ratio);
       }
     };
   }

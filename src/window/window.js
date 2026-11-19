@@ -340,28 +340,61 @@
     zoomBy(e.deltaY > 0 ? 1 / 1.15 : 1.15);
   }, { passive: false });
 
+  // The canvas follows its element's size as soon as the window is resized: the
+  // resize observer runs after layout and before paint, so the map is redrawn in the
+  // same frame instead of the old picture being shown stretched until the next one.
+  //
+  // Drawing cost grows with the canvas's pixels, and this window shares the GPU with
+  // the game's: a big map window on a Retina screen redrawn every frame starved
+  // whichever window was not focused, so one of them froze. So the canvas is sharp
+  // (Retina density) only while it stays within a pixel budget, and a big canvas is
+  // redrawn on every other frame (30 a second, which is how often data arrives).
+  var PIXEL_BUDGET = 700000;
+  var SMOOTH_PIXELS = 450000;
+  var SLOW_FRAME_MS = 30;
+  var lastRender = 0;
+
+  function pixelRatio() {
+    var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    var area = Math.max(1, canvas.clientWidth * canvas.clientHeight);
+    return Math.max(1, Math.min(dpr, Math.sqrt(PIXEL_BUDGET / area)));
+  }
+
   function fitCanvas() {
-    var w = canvas.clientWidth, h = canvas.clientHeight;
-    if (!w || !h) return;
-    if (canvas.width === w && canvas.height === h) return;
+    var k = pixelRatio(), w = Math.round(canvas.clientWidth * k), h = Math.round(canvas.clientHeight * k);
+    if (!w || !h) return false;
+    if (canvas.width === w && canvas.height === h) return false;
     canvas.width = w;
     canvas.height = h;
     dirty = true;
+    return true;
   }
 
-  function loop() {
+  function render(now) {
+    lastRender = now;
+    dirty = false;
+    var drawn = renderer.draw(canvas, frame, view, canvas.width / Math.max(1, canvas.clientWidth));
+    if (drawn && drawn.moving) dirty = true;
+  }
+
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(function () {
+      if (view.tab === "map" && fitCanvas()) render(performance.now());
+    }).observe(canvas);
+  }
+
+  function loop(now) {
     requestAnimationFrame(loop);
     if (view.tab !== "map") return;
     fitCanvas();
     if (!dirty) return;
-    dirty = false;
-    var drawn = renderer.draw(canvas, frame, view);
-    if (drawn && drawn.moving) dirty = true;
+    if (canvas.width * canvas.height > SMOOTH_PIXELS && now - lastRender < SLOW_FRAME_MS) return;
+    render(now);
   }
 
   showTab(view.tab);
   applySwitches();
   updatePanel();
   connect();
-  loop();
+  requestAnimationFrame(loop);
 })();

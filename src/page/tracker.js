@@ -2595,6 +2595,129 @@
       return { pts: pts, land: land, g: numberOrNull(a[G.aimGravity]) };
     } catch (e) { return null; }
   }
+  // ---- supply boxes ---------------------------------------------------------
+  // The game's bonus system keeps the live boxes (id -> box). A box has a mesh whose
+  // Object3D holds its position, a parachute while it falls, and bonus data whose
+  // light colour is set per box type. The type is guessed from that colour's hue,
+  // and learned for good when I pick a box up and one of my effects starts.
+  var bonusSystem = null;
+  var BOX_TYPES_KEY = "toCoords.boxTypes";
+  var BOX_PICKUP_M = 6;
+  var BOX_LEARN_MS = 1500;
+  var boxTypes = (function () { try { return JSON.parse(readSetting(BOX_TYPES_KEY, "{}")) || {}; } catch (e) { return {}; } })();
+  var boxWatch = { seen: new Map(), pickups: [], effects: null };
+
+  function isBonusSystem(o) {
+    try {
+      return !!o && typeof o === "object" && typeof o[G.bonusSpawn] === "function" && typeof o[G.bonusFind] === "function" &&
+        !!o[G.bonusBoxes] && typeof o[G.bonusBoxes][G.mapEntries] === "function";
+    } catch (e) { return false; }
+  }
+
+  function rememberBonusSystem(obj) {
+    if (bonusSystem || !obj || typeof obj !== "object") return;
+    try {
+      if (isBonusSystem(obj)) bonusSystem = obj;
+      else if (isBonusSystem(obj[G.bonusOwner])) bonusSystem = obj[G.bonusOwner];
+      else if (G.boxData in obj && isBonusSystem(obj[G.boxSystem])) bonusSystem = obj[G.boxSystem];
+      if (bonusSystem) logDebug("bonus system found");
+    } catch (e) {}
+  }
+
+  // Light colour (0xRRGGBB) of a box's bonus data: the first whole number in its light.
+  function boxColor(box) {
+    var light = box && box[G.boxData] && box[G.boxData][G.boxLight], keys, i, j, v, inner, ik;
+    if (!light || typeof light !== "object") return null;
+    keys = Object.keys(light);
+    for (i = 0; i < keys.length; i++) {
+      v = light[keys[i]];
+      if (v && typeof v === "object") {
+        ik = Object.keys(v);
+        for (j = 0; j < ik.length; j++) {
+          inner = v[ik[j]];
+          if (typeof inner === "number" && Math.floor(inner) === inner && inner >= 0 && inner <= 0xffffff) return inner;
+        }
+      }
+    }
+    return null;
+  }
+
+  function colorHex(c) { return c == null ? null : "#" + ("00000" + c.toString(16)).slice(-6); }
+
+  // Until a pickup confirms it, the type is a guess from the light's hue.
+  function guessBoxType(c) {
+    if (c == null) return null;
+    var r = (c >> 16 & 255) / 255, g = (c >> 8 & 255) / 255, b = (c & 255) / 255;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min, h;
+    if (max === 0 || d / max < 0.25) return "FIRST_AID";
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+    if (h < 0) h += 360;
+    if (h < 20 || h >= 330) return "DOUBLE_DAMAGE";
+    if (h < 70) return "NITRO";
+    if (h < 170) return "DOUBLE_ARMOR";
+    if (h < 260) return "CRYSTAL";
+    return "FIRST_AID";
+  }
+
+  function boxType(c) {
+    var key = colorHex(c);
+    return key && boxTypes[key] ? { type: boxTypes[key], sure: true } : { type: guessBoxType(c), sure: false };
+  }
+
+  function readBoxes() {
+    var out = [];
+    if (!bonusSystem) return out;
+    kotlinMapEach(bonusSystem[G.bonusBoxes], function (id, box) {
+      var mesh = box && box[G.boxMesh], obj = mesh && mesh[G.meshObject], pos = obj && parseMapVec(obj[G.objectPosition]);
+      if (!pos) return;
+      var color = boxColor(box), kind = boxType(color);
+      out.push({
+        key: idKey(id), x: toM(pos.x), y: toM(pos.y), z: toM(pos.z),
+        falling: box[G.boxParachute] != null, color: colorHex(color), type: kind.type, sure: kind.sure
+      });
+    });
+    return out;
+  }
+
+  // Effects of mine that are running now (seconds left), by supply type.
+  function myEffects(supplies) {
+    var out = {};
+    (supplies || []).forEach(function (s) { out[s.type] = s.active || 0; });
+    return out;
+  }
+
+  // A box that vanished next to my tank was picked up by me; the effect that starts
+  // right after tells its type.
+  function learnBoxTypes(now, boxes, me, supplies) {
+    var w = boxWatch, live = new Map(), effects = myEffects(supplies);
+    boxes.forEach(function (b) { if (b.key != null) live.set(b.key, b); });
+    w.seen.forEach(function (b, key) {
+      if (live.has(key) || b.falling || !me || b.color == null) return;
+      if (Math.hypot(b.x - me.x, b.y - me.y) <= BOX_PICKUP_M) w.pickups.push({ at: now, color: b.color, before: w.effects || {} });
+    });
+    w.pickups = w.pickups.filter(function (p) {
+      if (now - p.at > BOX_LEARN_MS) return false;
+      var started = Object.keys(effects).filter(function (t) { return effects[t] > 1 && !((p.before[t] || 0) > 0.5); });
+      if (started.length !== 1) return true;
+      if (boxTypes[p.color] !== started[0]) {
+        boxTypes[p.color] = started[0];
+        writeSetting(BOX_TYPES_KEY, JSON.stringify(boxTypes));
+        logDebug("box colour " + p.color + " = " + started[0]);
+      }
+      return false;
+    });
+    w.seen = live;
+    w.effects = effects;
+  }
+
+  function supplyBoxes(now, me, supplies) {
+    var boxes = readBoxes();
+    try { learnBoxTypes(now, boxes, me, supplies); } catch (e) {}
+    return boxes;
+  }
+
   var uiStore = null;
   function isUiStore(o) {
     try {
@@ -2622,6 +2745,7 @@
     rememberBattleParams(obj);
     rememberFollowCam(obj);
     rememberMagnumAim(obj);
+    rememberBonusSystem(obj);
     rememberBattlefieldCC(obj);
     rememberMapComp(obj);
   }
@@ -3455,6 +3579,7 @@
     cpLive = [];
     flagLive = [];
     magnumAim = null;
+    bonusSystem = null;
     battleParams = null;
     battlefieldCC = null;
     if (treesHidden.length) restoreTrees();
@@ -4056,7 +4181,7 @@
     }
     var sinceIn = Date.now() - (battle.enteredAt || 0);
     if ((hooks.physicsWorld || hooks.radarSystem || mountCandidates.length) && now >= nextLiveWalkAt &&
-        (sinceIn < 45000 || ((!battleParams || !followCam || !magnumAim || !uiStore) && sinceIn < 600000))) {
+        (sinceIn < 45000 || ((!battleParams || !followCam || !magnumAim || !uiStore || !bonusSystem) && sinceIn < 600000))) {
       try { walkBattleWorld(battleWorld(), 4); } catch (eLw) {}
       nextLiveWalkAt = now + 1000;
     }
@@ -4304,6 +4429,7 @@
       if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
       name = tankName(names, t.entity);
       kit = kitOf(kits, name);
+      if (tankWho && t.entity) tankWho.set(t.entity, { name: name || "?", side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown") });
       tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity), name: name, hitAt: hitAt(flashes, name), big: isJuggernaut(t.entity, kit), turret: turretOf(t.entity, kit), killedMeAt: killedMeAt(killer, name) });
     }
     var dead = [];
@@ -4384,9 +4510,14 @@
     if (aimState) aim = { pts: aimState.pts.map(function (q) { return [q.x, q.y]; }), land: aimState.land ? [aimState.land.x, aimState.land.y] : null };
     var shells = [];
     try { shells = trackMagnumShell(now, aimState); } catch (eSh) { shells = []; }
+    var damagePops = [];
+    try { pollDamage(now, markers); damagePops = recentDamage(now); } catch (eDm) { damagePops = []; }
+    var tank = null, boxes = [];
+    try { tank = tankInfo(now); } catch (eTk) { tank = null; }
+    try { boxes = supplyBoxes(now, me, tank && tank.supplies); } catch (eBx) { boxes = []; }
 
     return {
-      me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim, shells: shells,
+      me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim, shells: shells, damagePops: damagePops,
       speedKmh: speedState.kmh,
       status: statusText(),
       dead: dead,
@@ -4394,7 +4525,8 @@
       paused: isPaused(),
       grenadeAim: (function () { try { return grenadeAimState(now); } catch (e) { return null; } })(),
       parkour: { active: isParkour(), bushesHidden: bushesHidden },
-      tank: (function () { try { return tankInfo(now); } catch (e) { return null; } })(),
+      tank: tank,
+      boxes: boxes,
       time: now
     };
   }
@@ -4961,10 +5093,15 @@
     return out;
   }
 
+  // Nickname and side of a tank, as the map frame last saw it (radar + learned names).
+  var tankWho = typeof WeakMap === "function" ? new WeakMap() : null;
+
   function entityPlayer(entity) {
+    var known = tankWho && tankWho.get(entity);
+    if (known && known.name) return known;
     var userId = null, state = uiState(), users = state && state[G.battleUsers];
     kotlinMapEach(gameModeUserTanks(), function (id, tank) { if (tank === entity) userId = id; });
-    if (userId == null || !users) return { name: "?", side: "unknown" };
+    if (userId == null || !users) return { name: "?", side: known ? known.side : "unknown" };
     var myTeam = enumStr(kotlinMapGet(users[G.userTeams], state[G.session][G.ownUserId]));
     var team = enumStr(kotlinMapGet(users[G.userTeams], userId));
     var side = team === GAME.teams.a || team === GAME.teams.b ? sideOf(team, myTeam) : "enemy";
@@ -5010,15 +5147,28 @@
     });
   }
 
-  function damageLog() {
-    var now = Date.now(), own = localTankEntity(), tanks = taggedEntities(GAME.entityTags.tank), i, item, ev;
+  // Tanks to watch for the damage numbers the game shows me. The "Tank" tag is empty
+  // in current builds, so the radar's tank entities are watched as well.
+  function damageTanks(own, markers) {
+    var list = taggedEntities(GAME.entityTags.tank).slice(), seen = new Set(list), i, e;
+    for (i = 0; i < (markers || []).length; i++) {
+      e = markers[i] && markers[i].entity;
+      if (e && !seen.has(e)) { seen.add(e); list.push(e); }
+    }
+    return list.filter(function (t) { return t !== own; });
+  }
+
+  function pollDamage(now, markers) {
+    var own = localTankEntity(), tanks, i, item, ev;
     if (damage.battleId !== battle.id) {
       damage.battleId = battle.id;
       damage.log = [];
       damage.queue = [];
       damage.watchedCount = 0;
     }
-    damage.tankCount = tanks.filter(function (t) { return t !== own; }).length;
+    if (!markers) { try { markers = allTankMarkers(); } catch (eM) { markers = []; } }
+    tanks = damageTanks(own, markers);
+    damage.tankCount = tanks.length;
     for (i = 0; i < tanks.length; i++) watchDamage(tanks[i], own, now);
     while (damage.queue.length) {
       item = damage.queue.shift();
@@ -5031,7 +5181,24 @@
       });
     }
     if (damage.log.length > DAMAGE_LOG_MAX) damage.log.splice(0, damage.log.length - DAMAGE_LOG_MAX);
+  }
+
+  function damageLog() {
+    pollDamage(Date.now(), null);
     return damage.log;
+  }
+
+  // My hits of the last moments, for the numbers that pop up on the map. A killing
+  // hit stays up longer (the window shows it 3 s, with the victim's nickname).
+  var DAMAGE_POP_MS = 3000;
+  function recentDamage(now) {
+    var out = [], i, d;
+    for (i = damage.log.length - 1; i >= 0; i--) {
+      d = damage.log[i];
+      if (now - d.time > DAMAGE_POP_MS) break;
+      out.push({ id: d.id, amount: d.amount, critical: d.critical, fatal: d.fatal, at: d.time, target: d.target && d.target.name });
+    }
+    return out;
   }
 
   function isNum(o, key) { return typeof o[key] === "number"; }
@@ -5147,7 +5314,7 @@
       try { count = numberOrNull(found.slot[G.slotCount]()); } catch (e) {}
       try { cooldown = numberOrNull(found.slot[G.slotCooldown]()) || 0; } catch (e2) {}
       if (entry[2] && !(count > 0)) return;
-      out.push({ name: entry[1], count: count, cooldown: cooldown, active: effectLeft(cooldowns, found.type, now) });
+      out.push({ type: entry[0], name: entry[1], count: count, cooldown: cooldown, active: effectLeft(cooldowns, found.type, now) });
     });
     return out;
   }
@@ -5509,6 +5676,18 @@
           out.path = Math.round(c[G.cameraPath] * 1000) / 1000;
         }
       } catch (e) { out.error = String(e && e.message || e); }
+      return out;
+    },
+    // toCoords.boxDebug(): supply boxes the map sees, their light colour and type
+    // (sure: learned from a pickup; otherwise guessed from the colour).
+    boxDebug: function () {
+      var out = { system: !!bonusSystem, learned: boxTypes, boxes: [] };
+      try {
+        out.boxes = readBoxes().map(function (b) {
+          return { type: b.type, sure: b.sure, color: b.color, falling: b.falling, x: Math.round(b.x), y: Math.round(b.y), z: Math.round(b.z * 10) / 10 };
+        });
+      } catch (e) { out.error = String(e && e.message || e); }
+      console.log("[toCoords.boxDebug]", out);
       return out;
     },
     aimDebug: function () {

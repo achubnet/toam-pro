@@ -152,6 +152,12 @@
     aimHit: "s1ab_1", aimPointCount: "t1ab_1", aimPoints: "o1ab_1", aimPointPosition: "b14v_1",
     aimState: "k1ab_1", aimMark: "i1ab_1", aimActive: "m1ab_1", aimTankBody: "c1ab_1", aimGravity: "j1ab_1",
 
+    // supply boxes: the bonus system keeps live boxes by id; a box has its mesh (an
+    // Object3D with a position), a parachute while falling and its bonus data
+    bonusBoxes: "x111_1", bonusSpawn: "p118", bonusFind: "q118", bonusOwner: "n11c_1",
+    boxSystem: "d110_1", boxId: "g111_1", boxData: "s110_1", boxMesh: "p110_1", boxParachute: "q110_1",
+    boxFallSpeed: "x110_1", meshObject: "p113_1", objectPosition: "t35_1", boxLight: "d112_1",
+
     // console
     consolePrint: "z2i"
   };

@@ -155,6 +155,14 @@
       }).concat((raw.dead || []).map(function (d) { return { x: d.x, y: d.y, side: d.side, icon: "skull" }; })),
       paths: [path(raw.aim, PATH_COLORS.magnum), path(raw.grenadeAim, PATH_COLORS.grenade)].filter(Boolean),
       shells: (raw.shells || []).map(shell).filter(Boolean),
+      boxes: (raw.boxes || []).map(function (b) { return { x: b.x, y: b.y, z: b.z, type: b.type, falling: !!b.falling }; }),
+      supplies: ((raw.tank && raw.tank.supplies) || []).map(function (s) {
+        return { id: s.type, label: s.name, count: s.count, cooldown: s.cooldown, active: s.active };
+      }),
+      pops: (raw.damagePops || []).map(function (d) {
+        var name = d.target && d.target !== "?" ? d.target : null;
+        return { id: d.id, text: String(d.amount), style: d.fatal ? "kill" : (d.critical ? "crit" : "hit"), name: d.fatal ? name : null, at: d.at };
+      }),
       info: infoRows(raw),
       banner: banner(raw),
       summary: summary(raw),
