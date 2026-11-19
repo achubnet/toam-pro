@@ -93,8 +93,12 @@
 
   var HEALTH_BAR_W = 22;
 
+  function hasHealth(hp) {
+    return !!hp && isFiniteNum(hp.now) && hp.now > 0;
+  }
+
   function drawHealth(ctx, x, y, hp) {
-    if (!hp || !isFiniteNum(hp.now)) return;
+    if (!hasHealth(hp)) return;
     var frac = hp.max > 0 ? Math.max(0, Math.min(1, hp.now / hp.max)) : 1, color = healthColor(frac);
     ctx.save();
     ctx.font = "bold 9px ui-sans-serif, system-ui, sans-serif";
@@ -177,11 +181,13 @@
   }
 
   var MARK_ICONS = { skull: drawSkull, hazard: drawHazard };
+  // Marks drawn over the tank arrows rather than under them.
+  var MARKS_ON_TOP = { skull: true };
 
-  function drawMarks(ctx, vt, W, H, marks) {
+  function drawMarks(ctx, vt, W, H, marks, onTop) {
     for (var i = 0; i < (marks || []).length; i++) {
       var m = marks[i], draw = MARK_ICONS[m.icon], p = vt.toScreen(m.x, m.y);
-      if (!draw || offView(p, W, H, 10)) continue;
+      if (!draw || !!MARKS_ON_TOP[m.icon] !== onTop || offView(p, W, H, 10)) continue;
       ctx.save();
       ctx.globalAlpha = typeof m.alpha === "number" ? m.alpha : 1;
       draw(ctx, p.x, p.y, sideColor(m.side, SIDE.unknown));
@@ -324,7 +330,7 @@
       if (u.carrying) drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(u.carrying, SIDE.neutral));
       if (o.heights && o.selfZ != null && isFiniteNum(u.z)) drawHeightMark(ctx, p.x, p.y, u.z - o.selfZ);
       if (o.health) drawHealth(ctx, p.x + 9, p.y + 8, u.hp);
-      if (o.names && u.name) drawName(ctx, p.x, p.y + (o.health && u.hp ? 22 : 14), u.name, sideColor(u.side, SIDE.unknown));
+      if (o.names && u.name) drawName(ctx, p.x, p.y + (o.health && hasHealth(u.hp) ? 22 : 14), u.name, sideColor(u.side, SIDE.unknown));
     }
   }
 
@@ -496,8 +502,9 @@
       covered: function (o) { return !!roofs && layers.roofAbove(roofs, o.x, o.y, o.z); }
     };
     try { drawObjectives(ctx, vt.toScreen, W, H, f); } catch (eObj) {}
-    try { drawMarks(ctx, vt, W, H, f.marks); } catch (eM) {}
+    try { drawMarks(ctx, vt, W, H, f.marks, false); } catch (eM) {}
     try { drawUnits(ctx, vt, W, H, f.units, opts); } catch (eU) {}
+    try { drawMarks(ctx, vt, W, H, f.marks, true); } catch (eMT) {}
     (f.paths || []).forEach(function (path) {
       try { drawPath(ctx, vt.toScreen, path); } catch (eP) {}
     });
