@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TO Coords",
-  "description": "Карта Tanki Online в отдельном окне: свой танк, радар, флаги, точки",
+  "description": "TOAM Pro",
   "version": "2.0.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxKI77GnjEvgPkkMLiuygyhUYvF8z8ys+Eeur54KtnFsKP9Yi5y01vQRwO4982V/WVJbPcvV2bx61MxXXx0sKS339UBlcx7rsQFfhW4VPdLB72vgKAYwjaI+AisiliYo5UbCVPakvxV1UkFTXJ7xRt0AMul2oqKIZXZJOoyDpx1C3yH9BlcvbF7QZu4rbs4ktjCjAy2p8h1GJAfb8JiY/4MHtBRiVyQ3NMIAf3lBvnh3aTg9EnSCuCT0Ube7xghHsaX1SEMCFC43+b9a5hkty8PE3w9E7cDK1kPRC3chQ/TXGCfc6NifLtBe0jRnA/5ZNfShCbsfEJudbYeZ2XNTtYQIDAQAB",
   "icons": {

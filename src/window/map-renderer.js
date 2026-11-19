@@ -115,6 +115,20 @@
     ctx.restore();
   }
 
+  function drawName(ctx, x, y, name, color) {
+    ctx.save();
+    ctx.font = "7px ui-sans-serif, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.strokeText(name, x, y);
+    ctx.fillStyle = color;
+    ctx.fillText(name, x, y);
+    ctx.restore();
+  }
+
   function drawSkull(ctx, x, y, color) {
     ctx.save();
     ctx.lineJoin = "round";
@@ -310,6 +324,7 @@
       if (u.carrying) drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(u.carrying, SIDE.neutral));
       if (o.heights && o.selfZ != null && isFiniteNum(u.z)) drawHeightMark(ctx, p.x, p.y, u.z - o.selfZ);
       if (o.health) drawHealth(ctx, p.x + 9, p.y + 8, u.hp);
+      if (o.names && u.name) drawName(ctx, p.x, p.y + (o.health && u.hp ? 22 : 14), u.name, sideColor(u.side, SIDE.unknown));
     }
   }
 
@@ -477,6 +492,7 @@
       selfZ: self && isFiniteNum(self.z) ? self.z : null,
       heights: !!view.heights,
       health: !!view.health,
+      names: !!view.names,
       covered: function (o) { return !!roofs && layers.roofAbove(roofs, o.x, o.y, o.z); }
     };
     try { drawObjectives(ctx, vt.toScreen, W, H, f); } catch (eObj) {}

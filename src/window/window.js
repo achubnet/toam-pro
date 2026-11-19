@@ -4,7 +4,7 @@
   var SOURCE_TAB = Number(new URLSearchParams(location.search).get("tab"));
   var PORT_NAME = "map-view";
   var RECONNECT_MS = 1000;
-  var VIEW_SWITCHES = ["rotate", "heights", "roofs", "health", "info", "keys"];
+  var VIEW_SWITCHES = ["rotate", "heights", "roofs", "health", "names", "info", "keys"];
 
   var canvas = document.getElementById("map");
   var infoBox = document.getElementById("info");

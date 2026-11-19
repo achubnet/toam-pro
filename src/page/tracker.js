@@ -2412,7 +2412,7 @@
     flash(hide ? "кусты скрыты" : "кусты видны");
   }
   function applyParkourTrees() {
-    if (OFF.trees || !isParkour() || !mapComp || !bushesHidden) {
+    if (OFF.trees || !mapComp || !bushesHidden) {
       if (treesHidden.length) restoreTrees();
       return;
     }
@@ -2430,7 +2430,7 @@
   }
 
   var pkSearch = { q: null, seen: null, restarts: 0 };
-  function parkourSearchDone() { return parkourKnown() && (!isParkour() || !!mapComp); }
+  function parkourSearchDone() { return !!mapComp; }
   function parkourSearchStep(budgetMs) {
     if (parkourSearchDone()) { pkSearch.q = null; pkSearch.seen = null; return; }
     var t0 = performance.now(), n = 0, obj, keys, i, v;
@@ -2521,8 +2521,8 @@
   }
   function applyParkourCam() {
     if (OFF.camera || !followCams.length) return;
-    var i, parkour = isParkour();
-    if (parkour) {
+    var i, active = isParkour() || followCams.length > 0;
+    if (active) {
       for (i = 0; i < followCams.length; i++) {
         if (maybeOwnBody(camBody(followCams[i]))) setCamMult(followCams[i], parkourCam.mult);
       }
@@ -3373,6 +3373,26 @@
     return out;
   }
 
+  var RADAR_RANGE_ENGINE = 100000;
+  var lastGoodMarkers = [];
+
+  function extendRadarRange() {
+    try {
+      var params = hooks.radarSystem && hooks.radarSystem[G.radarParams];
+      if (!params) return;
+      if (isFiniteNum(params[G.radarEnterRange]) && params[G.radarEnterRange] < RADAR_RANGE_ENGINE) params[G.radarEnterRange] = RADAR_RANGE_ENGINE;
+      if (isFiniteNum(params[G.radarExitRange]) && params[G.radarExitRange] < RADAR_RANGE_ENGINE) params[G.radarExitRange] = RADAR_RANGE_ENGINE;
+    } catch (e) {}
+  }
+
+  function allTankMarkers() {
+    extendRadarRange();
+    var markers = radarMarkers();
+    if (markers.length) lastGoodMarkers = markers;
+    else if (lastGoodMarkers.length) markers = lastGoodMarkers;
+    return markers;
+  }
+
   var radarTrack = typeof WeakMap === "function" ? new WeakMap() : null;
   var RADAR_STEP_M = 0.6;
   function radarHeading(t, now) {
@@ -3420,6 +3440,7 @@
     hooks.mapName = null;
     hooks.radarSystem = null;
     radarScanRuns = 0;
+    lastGoodMarkers = [];
     if (dropFns) {
       hooks.localTankPosition = null;
       hooks.localTankAlive = null;
@@ -4081,8 +4102,8 @@
     return found ? { now: Math.max(0, Math.round(found[G.healthCurrent])), max: Math.round(found[G.healthMax]) } : null;
   }
 
-  function visibleHealth(entity, ally) {
-    if (!entity || (ally !== true && !isParkour())) return null;
+  function visibleHealth(entity) {
+    if (!entity) return null;
     return entityHealth(entity);
   }
 
@@ -4117,13 +4138,14 @@
     }
 
     var markers = [], tanks = [];
-    try { markers = radarMarkers(); } catch (eR) { markers = []; }
+    try { markers = allTankMarkers(); } catch (eR) { markers = []; }
     for (i = 0; i < markers.length; i++) {
       t = markers[i];
       hd = radarHeading(t, now);
       if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
-      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity, t.ally) });
+      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity), name: null });
     }
+    try { fillTankNames(tanks); } catch (eN) {}
     var dead = [];
     try { dead = updateDeaths(markers, now); } catch (eDead) {}
     if (me) {
@@ -4144,7 +4166,7 @@
       carrierSide = carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown";
       carriers.push({
         x: f.pos.x, y: f.pos.y, z: f.pos.z, side: carrierSide, flagSide: sideOf(f.team, flagLocal), hd: hd,
-        hp: carrierMarker ? visibleHealth(carrierMarker.entity, carrierSide === "ally") : null
+        hp: carrierMarker ? visibleHealth(carrierMarker.entity) : null
       });
     }
 
@@ -4797,8 +4819,8 @@
 
   function stepParkourCamera(factor) {
     if (OFF.camera) return flash("камера: выключена (toCoords.off)");
-    if (!isParkour()) {
-      return flash(parkourKnown() ? "камера: только в паркуре (формат боя: " + battleFormatName() + ")" : "камера: ищу формат боя…");
+    if (!followCams.length && !isParkour()) {
+      return flash(parkourKnown() ? "камера: ищу камеру…" : "камера: ищу формат боя…");
     }
     if (!followCam) return flash("камера: ещё ищу…");
     bumpParkourCam(factor);

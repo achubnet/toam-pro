@@ -102,10 +102,9 @@
   }
 
   function controls(parkour) {
-    var on = !!(parkour && parkour.active), hint = on ? null : PARKOUR_ONLY;
     return [
-      { id: "camera", type: "stepper", label: "Камера", enabled: on, hint: hint },
-      { id: "bushes", type: "switch", label: "Скрыть кусты", value: !!(parkour && parkour.bushesHidden), enabled: on, hint: hint }
+      { id: "camera", type: "stepper", label: "Камера", enabled: true },
+      { id: "bushes", type: "switch", label: "Скрыть кусты", value: !!(parkour && parkour.bushesHidden), enabled: true }
     ];
   }
 
@@ -121,7 +120,7 @@
 
   function frame(raw) {
     var units = (raw.tanks || []).map(function (t) {
-      return { x: t.x, y: t.y, z: t.z, side: t.side, dir: t.hd, hp: t.hp };
+      return { x: t.x, y: t.y, z: t.z, side: t.side, dir: t.hd, hp: t.hp, name: t.name };
     }).concat((raw.carriers || []).map(function (c) {
       return { x: c.x, y: c.y, z: c.z, side: c.side, dir: c.hd, hp: c.hp, carrying: c.flagSide };
     }));
