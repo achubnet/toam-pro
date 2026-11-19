@@ -355,7 +355,8 @@
     fitCanvas();
     if (!dirty) return;
     dirty = false;
-    renderer.draw(canvas, frame, view);
+    var drawn = renderer.draw(canvas, frame, view);
+    if (drawn && drawn.moving) dirty = true;
   }
 
   showTab(view.tab);

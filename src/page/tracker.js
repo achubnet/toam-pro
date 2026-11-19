@@ -2592,7 +2592,7 @@
       }
       var land = null;
       try { if (a[G.aimMark][G.isVisible]()) land = vecToM(parseMapVec(a[G.aimHit][G.hitPoint])); } catch (eL) {}
-      return { pts: pts, land: land };
+      return { pts: pts, land: land, g: numberOrNull(a[G.aimGravity]) };
     } catch (e) { return null; }
   }
   var uiStore = null;
@@ -4112,17 +4112,170 @@
     try { return body && body[G.bodyOwner] || null; } catch (e) { return null; }
   }
 
+  // Juggernaut: the boss tank of the Juggernaut mode, drawn twice as big on the map.
+  // Known by its hull in the player list, or by its Terminator gun on the tank itself.
+  var JUGGERNAUT = { hull: "Джаггернаут", weapon: "Terminator" };
+  var weaponComps = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  // Weapon kind straight from the tank (e.g. "Terminator", "ArtilleryRotating").
+  function weaponKindOf(entity) {
+    if (!entity) return "";
+    var c = weaponComps && weaponComps.get(entity);
+    if (!c) {
+      c = entityComponents(entity).filter(function (x) { try { return TANK_PARTS.weapon(x); } catch (e) { return false; } })[0];
+      if (!c) return "";
+      if (weaponComps) weaponComps.set(entity, c);
+    }
+    return enumStr(c[G.weaponKind]);
+  }
+
+  // Hull and turret of every player, by nickname, from the player list.
+  function kitsByName(users) {
+    var out = new Map();
+    if (!users) return out;
+    kotlinMapEach(users[G.userTanks], function (key, tank) {
+      var name = kotlinMapGet(users[G.userNames], key);
+      if (name != null) out.set(String(name), equipmentNames(tank));
+    });
+    return out;
+  }
+
+  function kitOf(kits, name) {
+    return kits && name != null ? kits.get(name) || null : null;
+  }
+
+  function isJuggernaut(entity, kit) {
+    if (kit && kit.hull === JUGGERNAUT.hull) return true;
+    try { return weaponKindOf(entity) === JUGGERNAUT.weapon; } catch (e) { return false; }
+  }
+
+  function turretOf(entity, kit) {
+    if (kit && kit.turret) return kit.turret;
+    var kind = "";
+    try { kind = weaponKindOf(entity); } catch (e) { kind = ""; }
+    return kind ? (TOC.catalog.weaponKinds[kind] || kind) : null;
+  }
+
+  function ownIsJuggernaut() {
+    try { if (ownKit().hull === JUGGERNAUT.hull) return true; } catch (e) {}
+    try { return weaponKindOf(ownEntity()) === JUGGERNAUT.weapon; } catch (e2) { return false; }
+  }
+
+  // My Magnum shell in flight. The game's aim arc is the shell's exact path: only
+  // gravity acts on it, no drag. So on the shot keep the last arc shown and time it.
+  // Along the arc the height is a parabola in horizontal distance, z = c + b·d + a·d²,
+  // and with gravity g the horizontal speed is sqrt(g / -2a); time = distance / speed.
+  var SHELL_SNAP_MS = 300;
+  var SHELL_LINGER_MS = 700;   // the window shows the burst for 0.5 s after landing
+  var SHELLS_MAX = 12;
+  var magnumShell = { battleId: undefined, shots: null, snap: null, flights: [] };
+
+  // Least-squares z = a·d² + b·d + c; returns a. d is centred first, which leaves a unchanged.
+  function parabolaCurve(ds, zs) {
+    var n = ds.length, mean = 0, i, d, S = [0, 0, 0, 0, 0], T = [0, 0, 0];
+    for (i = 0; i < n; i++) mean += ds[i] / n;
+    for (i = 0; i < n; i++) {
+      d = ds[i] - mean;
+      S[0] += 1; S[1] += d; S[2] += d * d; S[3] += d * d * d; S[4] += d * d * d * d;
+      T[0] += zs[i]; T[1] += zs[i] * d; T[2] += zs[i] * d * d;
+    }
+    // Normal equations for (a, b, c), solved by elimination with pivoting.
+    var m = [[S[4], S[3], S[2], T[2]], [S[3], S[2], S[1], T[1]], [S[2], S[1], S[0], T[0]]], r, c, k, f, x = [0, 0, 0];
+    for (c = 0; c < 3; c++) {
+      for (r = c + 1; r < 3; r++) if (Math.abs(m[r][c]) > Math.abs(m[c][c])) { k = m[c]; m[c] = m[r]; m[r] = k; }
+      if (Math.abs(m[c][c]) < 1e-12) return null;
+      for (r = c + 1; r < 3; r++) {
+        f = m[r][c] / m[c][c];
+        for (k = c; k < 4; k++) m[r][k] -= f * m[c][k];
+      }
+    }
+    for (r = 2; r >= 0; r--) {
+      f = m[r][3];
+      for (k = r + 1; k < 3; k++) f -= m[r][k] * x[k];
+      x[r] = f / m[r][r];
+    }
+    return x[0];
+  }
+
+  // pts: arc points in metres {x,y,z}; g: gravity, m/s²; origin: muzzle {x,y} or null.
+  // Returns [[x, y, ms since the shot], ...] or null when the arc can't be timed.
+  function shellPath(pts, g, origin, land) {
+    if (!pts || pts.length < 4 || !(g > 0)) return null;
+    var ds = [], zs = [], i, sum = 0, p, q;
+    for (i = 0; i < pts.length; i++) {
+      if (i) sum += Math.sqrt(Math.pow(pts[i].x - pts[i - 1].x, 2) + Math.pow(pts[i].y - pts[i - 1].y, 2));
+      ds.push(sum);
+      zs.push(pts[i].z);
+    }
+    var curve = parabolaCurve(ds, zs);
+    if (!(curve < 0)) return null;
+    var speed = Math.sqrt(g / (-2 * curve));
+    if (!(speed > 0.5)) return null;
+    var start = origin ? Math.sqrt(Math.pow(pts[0].x - origin.x, 2) + Math.pow(pts[0].y - origin.y, 2)) : 0;
+    var out = origin ? [[origin.x, origin.y, 0]] : [];
+    for (i = 0; i < pts.length; i++) out.push([pts[i].x, pts[i].y, (start + ds[i]) / speed * 1000]);
+    if (land) {
+      p = pts[pts.length - 1];
+      q = Math.sqrt(Math.pow(land.x - p.x, 2) + Math.pow(land.y - p.y, 2));
+      out.push([land.x, land.y, (start + sum + q) / speed * 1000]);
+    }
+    return out;
+  }
+
+  function magnumShotCount(now) {
+    var p = localTankParts(now), m = p && p.magnum, n = m ? m[G.magnumShots] : null;
+    return typeof n === "number" && isFinite(n) ? n : null;
+  }
+
+  function trackMagnumShell(now, aimState) {
+    var sh = magnumShell, shots = null, muzzle = null;
+    if (sh.battleId !== battle.id) {
+      sh.battleId = battle.id;
+      sh.shots = null; sh.snap = null; sh.flights = [];
+    }
+    try { shots = magnumShotCount(now); } catch (eS) { shots = null; }
+    if (aimState && aimState.pts && aimState.pts.length > 3) {
+      try { muzzle = lastMeEngine && dirFromLocalMount(lastMeEngine); } catch (eM) { muzzle = null; }
+      sh.snap = {
+        at: now, pts: aimState.pts, land: aimState.land,
+        g: isFiniteNum(aimState.g) ? toM(Math.abs(aimState.g)) : null,
+        origin: muzzle && muzzle.origin ? { x: toM(muzzle.origin.x), y: toM(muzzle.origin.y) } : null
+      };
+    }
+    if (shots != null && sh.shots != null && shots > sh.shots && sh.snap && now - sh.snap.at < SHELL_SNAP_MS) {
+      var path = shellPath(sh.snap.pts, sh.snap.g, sh.snap.origin, sh.snap.land);
+      if (path) sh.flights.push({ path: path, firedAt: now });
+      if (sh.flights.length > SHELLS_MAX) sh.flights.shift();
+    }
+    if (shots != null) sh.shots = shots;
+    // Several shells can be in the air at once; each goes when its burst is over.
+    sh.flights = sh.flights.filter(function (f) { return now - f.firedAt <= f.path[f.path.length - 1][2] + SHELL_LINGER_MS; });
+    return sh.flights;
+  }
+
+  // The map turns with the barrel, so read it every frame. The ray cast that also
+  // reports it runs only 4 times a second, which made the turning jerky.
+  function liveBarrelDir() {
+    var found = null, cam = null;
+    try { found = lastMeEngine && dirFromLocalMount(lastMeEngine); } catch (eM) { found = null; }
+    if (found) return found.dir;
+    try { cam = hooks.camera ? dirFromCamera() : null; } catch (eC) { cam = null; }
+    if (cam) return cam;
+    return lastRayDebug && lastRayDebug.barrel && lastRayDebug.barrel.forward || null;
+  }
+
   function buildMapFrame() {
     var now = Date.now(), local = localTeamName(), i, j, t, hd;
     var me = lastMe && isFiniteNum(lastMe.x) ? {
       x: lastMe.x, y: lastMe.y,
       z: isFiniteNum(lastMe.z) ? lastMe.z : null,
       heading: isFiniteNum(lastMe.heading) ? lastMe.heading : null,
-      hp: entityHealth(ownEntity())
+      hp: entityHealth(ownEntity()),
+      big: ownIsJuggernaut()
     } : null;
     var ray = null;
     if (me) {
-      var barrel = lastRayDebug && lastRayDebug.barrel && lastRayDebug.barrel.forward;
+      var barrel = liveBarrelDir();
       ray = {
         dx: barrel && isFiniteNum(barrel.x) ? barrel.x : null,
         dy: barrel && isFiniteNum(barrel.y) ? barrel.y : null,
@@ -4137,15 +4290,22 @@
       else dropped.push({ x: flags[i].pos.x, y: flags[i].pos.y, side: sideOf(flags[i].team, flags[i].local || local) });
     }
 
-    var markers = [], tanks = [];
+    var markers = [], tanks = [], names = null, name;
     try { markers = allTankMarkers(); } catch (eR) { markers = []; }
+    try { names = tankNamesByEntity(markers); } catch (eN) { names = null; }
+    var flashes = null, hitState = uiState(), kits = null, kit;
+    try { flashes = trackHits(now, lastMeEngine, me && me.hp, markers, names, hitState); } catch (eH) { flashes = null; }
+    try { kits = kitsByName(hitState && hitState[G.battleUsers]); } catch (eJ) { kits = null; }
+    var killer = null;
+    try { killer = myKiller(now); } catch (eKl) { killer = null; }
     for (i = 0; i < markers.length; i++) {
       t = markers[i];
       hd = radarHeading(t, now);
       if (carried.length && nearCarriedFlag(t.pos, carried)) continue;
-      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity), name: null });
+      name = tankName(names, t.entity);
+      kit = kitOf(kits, name);
+      tanks.push({ x: t.pos.x, y: t.pos.y, z: t.pos.z, side: t.ally === true ? "ally" : (t.ally === false ? "enemy" : "unknown"), hd: hd, hp: visibleHealth(t.entity), name: name, hitAt: hitAt(flashes, name), big: isJuggernaut(t.entity, kit), turret: turretOf(t.entity, kit), killedMeAt: killedMeAt(killer, name) });
     }
-    try { fillTankNames(tanks); } catch (eN) {}
     var dead = [];
     try { dead = updateDeaths(markers, now); } catch (eDead) {}
     if (me) {
@@ -4166,7 +4326,10 @@
       carrierSide = carrierTeam ? sideOf(carrierTeam, flagLocal) : "unknown";
       carriers.push({
         x: f.pos.x, y: f.pos.y, z: f.pos.z, side: carrierSide, flagSide: sideOf(f.team, flagLocal), hd: hd,
-        hp: carrierMarker ? visibleHealth(carrierMarker.entity) : null
+        hp: carrierMarker ? visibleHealth(carrierMarker.entity) : null,
+        name: carrierMarker ? tankName(names, carrierMarker.entity) : null,
+        hitAt: carrierMarker ? hitAt(flashes, tankName(names, carrierMarker.entity)) : null,
+        killedMeAt: carrierMarker ? killedMeAt(killer, tankName(names, carrierMarker.entity)) : null
       });
     }
 
@@ -4219,9 +4382,11 @@
     var aim = null, aimState = null;
     try { aimState = magnumAimState(); } catch (eA) { aimState = null; }
     if (aimState) aim = { pts: aimState.pts.map(function (q) { return [q.x, q.y]; }), land: aimState.land ? [aimState.land.x, aimState.land.y] : null };
+    var shells = [];
+    try { shells = trackMagnumShell(now, aimState); } catch (eSh) { shells = []; }
 
     return {
-      me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim,
+      me: me, ray: ray, tanks: tanks, carriers: carriers, bases: bases, dropped: dropped, cps: cps, aim: aim, shells: shells,
       speedKmh: speedState.kmh,
       status: statusText(),
       dead: dead,
@@ -4229,7 +4394,8 @@
       paused: isPaused(),
       grenadeAim: (function () { try { return grenadeAimState(now); } catch (e) { return null; } })(),
       parkour: { active: isParkour(), bushesHidden: bushesHidden },
-      tank: (function () { try { return tankInfo(now); } catch (e) { return null; } })()
+      tank: (function () { try { return tankInfo(now); } catch (e) { return null; } })(),
+      time: now
     };
   }
 
@@ -4377,6 +4543,23 @@
     return kills.log;
   }
 
+  // Who killed me: their tank glows yellow on the map for a few seconds after.
+  var KILLER_GLOW_MS = 5000;
+
+  function myKiller(now) {
+    var log = killFeed(), i, k;
+    for (i = log.length - 1; i >= 0; i--) {
+      k = log[i];
+      if (now - k.time > KILLER_GLOW_MS) break;
+      if (k.victim && k.victim.me && k.killer && !k.killer.me && k.killer.name) return { name: k.killer.name, at: k.time };
+    }
+    return null;
+  }
+
+  function killedMeAt(killer, name) {
+    return killer && name != null && name === killer.name ? killer.at : null;
+  }
+
   function taggedEntities(tag) {
     var world = battleWorld(), list = null;
     try { list = world && world[G.entityTags] && world[G.entityTags][G.jsMap].get(tag); } catch (e) {}
@@ -4499,6 +4682,285 @@
     return null;
   }
 
+  // Tank entity -> player nickname. The game's "user -> tank entity" table is not
+  // reachable in every build, so learn which component field of a tank entity
+  // holds its user id (checked against our own tank) and read names through it.
+  var USER_LINK_RETRY_MS = 2000;
+  var userLink = { battleId: undefined, ctor: null, prop: null, triedAt: 0 };
+  var userLinkComps = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  function idKey(v) {
+    if (v == null) return null;
+    if (typeof v === "number" || typeof v === "string") return String(v);
+    if (typeof v !== "object") return null;
+    var s = "", parts = [];
+    try { s = String(v); } catch (e) { s = ""; }
+    if (s && s.indexOf("[object") !== 0) return s;
+    try {
+      Object.keys(v).forEach(function (k) {
+        if (typeof v[k] === "number" || typeof v[k] === "string") parts.push(k + "=" + v[k]);
+      });
+    } catch (e2) {}
+    return parts.length ? parts.join(",") : null;
+  }
+
+  function userNameIndex(users) {
+    var idx = { byId: new Map(), idCtor: null };
+    kotlinMapEach(users[G.userNames], function (id, name) {
+      var key = idKey(id);
+      if (key == null || name == null || name === "") return;
+      if (!idx.idCtor && typeof id === "object") idx.idCtor = id.constructor;
+      idx.byId.set(key, String(name));
+    });
+    return idx;
+  }
+
+  function looksLikeUserId(v, idx) {
+    if (v == null) return false;
+    if (!idx.idCtor) return typeof v === "number" || typeof v === "string";
+    try { return typeof v === "object" && v.constructor === idx.idCtor; } catch (e) { return false; }
+  }
+
+  // fn(component, prop, idKey) for every component field holding a known user id.
+  function eachUserIdField(entity, idx, fn) {
+    entityComponents(entity).forEach(function (c) {
+      if (!c || typeof c !== "object") return;
+      var keys, i, v, key;
+      try { keys = Object.keys(c); } catch (e) { return; }
+      for (i = 0; i < keys.length; i++) {
+        try { v = c[keys[i]]; } catch (e2) { continue; }
+        if (!looksLikeUserId(v, idx)) continue;
+        key = idKey(v);
+        if (key != null && idx.byId.has(key)) fn(c, keys[i], key);
+      }
+    });
+  }
+
+  function linkedUserId(entity, link) {
+    var hit = userLinkComps && userLinkComps.get(entity);
+    if (!hit || hit.ctor !== link.ctor) {
+      var comp = entityComponents(entity).filter(function (c) { return c && c.constructor === link.ctor; })[0];
+      if (!comp) return null;
+      hit = { ctor: link.ctor, comp: comp };
+      if (userLinkComps) userLinkComps.set(entity, hit);
+    }
+    try { return idKey(hit.comp[link.prop]); } catch (e) { return null; }
+  }
+
+  // The owner field holds a different user on every tank and our own id on our tank.
+  function learnUserLink(entities, idx, own, ownId) {
+    var cands = [];
+    entities.forEach(function (e) {
+      eachUserIdField(e, idx, function (c, prop, key) {
+        var cand = cands.filter(function (x) { return x.ctor === c.constructor && x.prop === prop; })[0];
+        if (!cand) { cand = { ctor: c.constructor, prop: prop, hits: 0, ids: new Set(), own: null }; cands.push(cand); }
+        cand.hits++;
+        cand.ids.add(key);
+      });
+    });
+    cands.forEach(function (cand) {
+      if (own && ownId != null) cand.own = linkedUserId(own, cand) === ownId;
+    });
+    // Only a field confirmed on our own tank: a "last hit by" field also looks unique per tank.
+    var best = null;
+    cands.forEach(function (cand) {
+      if (cand.own !== true || cand.hits !== cand.ids.size) return;
+      if (!best || cand.ids.size > best.ids.size) best = cand;
+    });
+    return { best: best, cands: cands };
+  }
+
+  function currentUserLink(entities, idx, state) {
+    var now = Date.now(), own = null, ownId = null;
+    if (userLink.battleId !== battle.id) {
+      userLink.battleId = battle.id;
+      userLink.ctor = null;
+      userLink.prop = null;
+      userLink.triedAt = 0;
+    }
+    if (userLink.ctor) return userLink;
+    if (!entities.length || now - userLink.triedAt < USER_LINK_RETRY_MS) return null;
+    userLink.triedAt = now;
+    try { own = ownEntity(); } catch (e) {}
+    try { ownId = idKey(state[G.session][G.ownUserId]); } catch (e2) {}
+    var best = learnUserLink(entities, idx, own, ownId).best;
+    if (!best) return null;
+    userLink.ctor = best.ctor;
+    userLink.prop = best.prop;
+    return userLink;
+  }
+
+  function tankNamesByEntity(markers) {
+    var out = new Map(), state = uiState(), users = state && state[G.battleUsers];
+    if (!users) return out;
+    var idx = userNameIndex(users);
+    if (!idx.byId.size) return out;
+    var entities = (markers || []).map(function (m) { return m.entity; }).filter(Boolean);
+    var link = currentUserLink(entities, idx, state);
+    if (!link) return out;
+    entities.forEach(function (e) {
+      var key = linkedUserId(e, link);
+      if (key != null && idx.byId.has(key)) out.set(e, idx.byId.get(key));
+    });
+    if (entities.length && !out.size) userLink.ctor = null;
+    return out;
+  }
+
+  function tankName(names, entity) {
+    return names && entity ? names.get(entity) || null : null;
+  }
+
+  // toCoords.namesDebug(): how radar tanks get matched to player nicknames.
+  function namesDebug() {
+    function ctorName(f) { try { return f && f.name || "?"; } catch (e) { return "?"; } }
+    var out = { users: false, userNames: 0, idType: null, ownId: false, ownEntity: false, radar: 0,
+      link: null, named: 0, sample: [], candidates: [] };
+    var state = uiState(), users = state && state[G.battleUsers], markers = [], own = null, ownId = null;
+    out.users = !!users;
+    if (!users) return out;
+    var idx = userNameIndex(users);
+    out.userNames = idx.byId.size;
+    out.idType = idx.idCtor ? ctorName(idx.idCtor) : "primitive";
+    try { markers = allTankMarkers(); } catch (eR) {}
+    var entities = markers.map(function (m) { return m.entity; }).filter(Boolean);
+    out.radar = entities.length;
+    try { own = ownEntity(); } catch (e) {}
+    try { ownId = idKey(state[G.session][G.ownUserId]); } catch (e2) {}
+    out.ownEntity = !!own;
+    out.ownId = ownId != null && idx.byId.has(ownId);
+    out.candidates = learnUserLink(entities, idx, own, ownId).cands.slice(0, 8).map(function (c) {
+      return ctorName(c.ctor) + "." + c.prop + " hits=" + c.hits + " ids=" + c.ids.size + " own=" + c.own;
+    });
+    var names = tankNamesByEntity(markers);
+    out.link = userLink.ctor ? ctorName(userLink.ctor) + "." + userLink.prop : null;
+    out.named = names.size;
+    names.forEach(function (name) { if (out.sample.length < 3) out.sample.push(name); });
+    console.log("[toCoords.namesDebug]", out);
+    return out;
+  }
+
+  // Who hit me: when our hp drops, the enemy whose barrel line passes closest to us.
+  // Read-only: uses the muzzle sockets of each tank's weapon mount (world position and
+  // direction), the same data our own barrel direction comes from.
+  var HIT_FLASH_MS = 1200;
+  var HIT_AIM_MISS_M = 6;
+  var HIT_AIM_MAX_M = 400;
+  var hits = {
+    battleId: undefined, lastHp: null, flashes: new Map(), drops: [],
+    mounts: typeof WeakMap === "function" ? new WeakMap() : null
+  };
+
+  // Our teammates' nicknames: they can't damage us, so they are never the shooter.
+  function allyNames(users, state, markers, names) {
+    var out = new Set(), myTeam = "";
+    try { myTeam = enumStr(kotlinMapGet(users[G.userTeams], state[G.session][G.ownUserId])); } catch (e) {}
+    if (myTeam === GAME.teams.a || myTeam === GAME.teams.b) {
+      kotlinMapEach(users[G.userNames], function (id, name) {
+        if (enumStr(kotlinMapGet(users[G.userTeams], id)) === myTeam) out.add(String(name));
+      });
+    }
+    (markers || []).forEach(function (m) {
+      var name = m.ally === true && names ? names.get(m.entity) : null;
+      if (name) out.add(name);
+    });
+    return out;
+  }
+
+  function weaponMount(entity) {
+    var c = hits.mounts && hits.mounts.get(entity);
+    if (c) return c;
+    c = entityComponents(entity).filter(function (x) { try { return TANK_PARTS.mount(x); } catch (e) { return false; } })[0] || null;
+    if (c && hits.mounts) hits.mounts.set(entity, c);
+    return c;
+  }
+
+  // { side, dist } in metres: how far beside us this tank's barrel line passes, and how
+  // far ahead of the muzzle we are. null when it has no muzzle or points away from us.
+  function aimMiss(entity, me) {
+    var mount = weaponMount(entity), socks, i, s, p, d, len, tx, ty, along, side, best = null;
+    if (!mount) return null;
+    try { socks = mount[G.mountSockets] || []; } catch (e) { return null; }
+    for (i = 0; i < socks.length; i++) {
+      s = socks[i];
+      if (!looksLikeMuzzleSocket(s)) continue;
+      p = s[G.socketPosition];
+      d = s[G.socketDirection];
+      len = Math.sqrt(d[G.x] * d[G.x] + d[G.y] * d[G.y]);
+      if (len < 1e-6) continue;
+      tx = me.x - p[G.x];
+      ty = me.y - p[G.y];
+      along = (tx * d[G.x] + ty * d[G.y]) / len;
+      if (along <= 0) continue;
+      side = toM(Math.abs(tx * d[G.y] - ty * d[G.x]) / len);
+      if (!best || side < best.side) best = { side: side, dist: toM(along) };
+    }
+    return best;
+  }
+
+  // Enemies on the radar, closest barrel line first.
+  function aimingAtMe(markers, names, allies, me) {
+    var out = [];
+    (markers || []).forEach(function (m) {
+      var name = m.entity && names ? names.get(m.entity) : null, miss;
+      if (!name || m.ally === true || allies.has(name)) return;
+      miss = aimMiss(m.entity, me);
+      if (miss) out.push({ name: name, side: miss.side, dist: miss.dist });
+    });
+    out.sort(function (a, b) { return a.side - b.side; });
+    return out;
+  }
+
+  function aimText(a) {
+    return a.name + ": мимо " + a.side.toFixed(1) + " м, до него " + Math.round(a.dist) + " м";
+  }
+
+  // Once per map frame; returns nickname -> time they hit us. me is in engine units.
+  function trackHits(now, me, hp, markers, names, state) {
+    if (hits.battleId !== battle.id) {
+      hits.battleId = battle.id;
+      hits.lastHp = null;
+      hits.flashes.clear();
+    }
+    var last = hits.lastHp, users = state && state[G.battleUsers];
+    hits.lastHp = hp && isFiniteNum(hp.now) ? { now: hp.now, max: hp.max } : null;
+    if (me && users && hp && last && hp.max === last.max && hp.now < last.now) {
+      var aims = aimingAtMe(markers, names, allyNames(users, state, markers, names), me);
+      var shooter = aims[0] && aims[0].side <= HIT_AIM_MISS_M && aims[0].dist <= HIT_AIM_MAX_M ? aims[0] : null;
+      if (shooter) hits.flashes.set(shooter.name, now);
+      hits.drops.push({ at: now, hp: last.now + "→" + hp.now, by: shooter ? shooter.name : null, aims: aims.slice(0, 4).map(aimText) });
+      if (hits.drops.length > 8) hits.drops.shift();
+    }
+    hits.flashes.forEach(function (at, name) { if (now - at >= HIT_FLASH_MS) hits.flashes.delete(name); });
+    return hits.flashes;
+  }
+
+  function hitAt(flashes, name) {
+    return flashes && name ? flashes.get(name) || null : null;
+  }
+
+  // toCoords.hitDebug(): which enemies aim at us now, and what each hp drop picked.
+  function hitDebug() {
+    var now = Date.now(), state = uiState(), users = state && state[G.battleUsers];
+    var markers = [], names = null, aims = [], withMount = 0, enemies = 0;
+    try { markers = allTankMarkers(); } catch (eR) {}
+    try { names = tankNamesByEntity(markers); } catch (eN) {}
+    markers.forEach(function (m) {
+      if (!m.entity) return;
+      if (m.ally !== true) enemies++;
+      if (weaponMount(m.entity)) withMount++;
+    });
+    if (users && lastMeEngine) {
+      try { aims = aimingAtMe(markers, names, allyNames(users, state, markers, names), lastMeEngine).slice(0, 6).map(aimText); } catch (eA) { aims = ["error: " + (eA && eA.message || eA)]; }
+    }
+    var out = {
+      me: !!lastMeEngine, radar: markers.length, enemies: enemies, withMount: withMount, named: names ? names.size : 0,
+      aimNow: aims,
+      drops: hits.drops.map(function (d) { return { ago: now - d.at, hp: d.hp, by: d.by, aims: d.aims }; })
+    };
+    console.log("[toCoords.hitDebug]", out);
+    return out;
+  }
+
   function entityPlayer(entity) {
     var userId = null, state = uiState(), users = state && state[G.battleUsers];
     kotlinMapEach(gameModeUserTanks(), function (id, tank) { if (tank === entity) userId = id; });
@@ -4581,7 +5043,7 @@
     reloadStatus: function (c) { return typeof c[G.reloadProgress] === "function"; },
     reloadTimer: function (c) { return isNum(c, G.reloadTime) && isNum(c, G.reloadReadyAt) && typeof c[G.reloadStunned] === "boolean"; },
     salvo: function (c) { return isNum(c, G.salvoReloadTime) && isNum(c, G.salvoEndsAt); },
-    magnum: function (c) { return isNum(c, G.magnumReloadTime) && G.magnumCharge in c; },
+    magnum: function (c) { return (isNum(c, G.magnumReloadTime) || isNum(c, G.magnumShots)) && G.magnumCharge in c; },
     idle: function (c) { return isNum(c, G.idlePeriod) && isNum(c, G.idleElapsed) && isNum(c, G.idleWarnAt) && typeof c[G.idlePaused] === "boolean"; },
     weapon: function (c) { return G.weaponKind in c; },
     overdrive: function (c) {
@@ -5006,6 +5468,8 @@
     loadMapFile: loadMapFile,
     saveMap: saveMap,
     headingDebug: headingDebug,
+    namesDebug: namesDebug,
+    hitDebug: hitDebug,
     engineRays: function (on) {
       if (on === true || on === false) {
         engineRaysOn = on;
@@ -5048,9 +5512,15 @@
       return out;
     },
     aimDebug: function () {
-      var st = magnumAimState();
-      if (!st) return { found: !!magnumAim, showing: false };
-      return { found: true, showing: true, points: st.pts.length, land: st.land ? { x: Math.round(st.land.x * 10) / 10, y: Math.round(st.land.y * 10) / 10 } : null };
+      var st = magnumAimState(), now = Date.now(), sh = magnumShell, shots = null;
+      try { shots = magnumShotCount(now); } catch (e) { shots = null; }
+      var shell = {
+        shots: shots, lastArcMsAgo: sh.snap ? now - sh.snap.at : null, gravity: sh.snap ? sh.snap.g : null,
+        flying: sh.flights.length,
+        flightS: sh.flights.map(function (f) { return Math.round(f.path[f.path.length - 1][2]) / 1000; })
+      };
+      if (!st) return { found: !!magnumAim, showing: false, shell: shell };
+      return { found: true, showing: true, points: st.pts.length, land: st.land ? { x: Math.round(st.land.x * 10) / 10, y: Math.round(st.land.y * 10) / 10 } : null, shell: shell };
     },
     flagDebug: function () {
       return flagLiveStates().map(function (f) {

@@ -50,9 +50,13 @@
     return SIDE[side] || fallback || SIDE.unknown;
   }
 
-  function drawSelfArrow(ctx, x, y, dx, dy) {
-    drawArrow(ctx, x, y, dx, dy, "#ffffff", "#000000", 1);
+  function drawSelfArrow(ctx, x, y, dx, dy, k) {
+    drawArrow(ctx, x, y, dx, dy, "#ffffff", "#000000", k || 1);
   }
+
+  // The Juggernaut's marker is twice as big; labels around it move out to match.
+  var BIG_SCALE = 2;
+  function unitScale(u) { return u && u.big ? BIG_SCALE : 1; }
 
   function drawFlagIcon(ctx, x, y, color, k, outline) {
     var top = y - 20 * k, w = 14 * k, h = 10 * k;
@@ -119,18 +123,148 @@
     ctx.restore();
   }
 
-  function drawName(ctx, x, y, name, color) {
+  // Team colours, made very light so the names stand out on the map.
+  var NAME_COLORS = {
+    ally: "#c9dcff", blue: "#c9dcff", enemy: "#ffcaca", red: "#ffcaca",
+    neutral: "#eef2f6", unknown: "#eef2f6"
+  };
+  var HIT_COLOR = "#ffd400";
+  var HIT_BLINK_MS = 200;
+  var HIT_BLINKS = 3;
+
+  // True during the three yellow blinks after this player hit us.
+  function hitBlinkOn(u) {
+    if (!isFiniteNum(u.hitAt)) return false;
+    var t = Date.now() - u.hitAt;
+    return t >= 0 && t < HIT_BLINK_MS * 2 * HIT_BLINKS && Math.floor(t / HIT_BLINK_MS) % 2 === 0;
+  }
+
+  // The tank that killed me: arrow turns yellow and pulses with a glow for 5 seconds.
+  var KILLER_GLOW_MS = 5000;
+  function killerGlow(u) {
+    if (!isFiniteNum(u.killedMeAt)) return 0;
+    var t = Date.now() - u.killedMeAt;
+    if (t < 0 || t >= KILLER_GLOW_MS) return 0;
+    return 10 + 8 * (0.5 + 0.5 * Math.cos(t / 1000 * Math.PI * 3));
+  }
+
+  function nameColor(u) {
+    return hitBlinkOn(u) ? HIT_COLOR : (NAME_COLORS[u.side] || NAME_COLORS.unknown);
+  }
+
+  // Frame around the shooter: thick yellow line with a strong glow, drawn twice so
+  // the glow stacks up and is seen at a glance.
+  var HIT_GLOW_PX = 18;
+  function drawHitFrame(ctx, x, y, s) {
+    var r = 14 * (s || 1);
     ctx.save();
-    ctx.font = "7px ui-sans-serif, system-ui, sans-serif";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.lineWidth = 6;
+    ctx.strokeRect(x - r, y - r, r * 2, r * 2);
+    ctx.fillStyle = "rgba(255,212,0,0.18)";
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    ctx.shadowColor = HIT_COLOR;
+    ctx.shadowBlur = HIT_GLOW_PX;
+    ctx.strokeStyle = HIT_COLOR;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x - r, y - r, r * 2, r * 2);
+    ctx.strokeRect(x - r, y - r, r * 2, r * 2);
+    ctx.restore();
+  }
+
+  function drawName(ctx, x, y, name, color, underline) {
+    ctx.save();
+    ctx.font = "9px ui-sans-serif, system-ui, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     ctx.lineJoin = "round";
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 3;
     ctx.strokeStyle = "rgba(0,0,0,0.85)";
     ctx.strokeText(name, x, y);
     ctx.fillStyle = color;
     ctx.fillText(name, x, y);
+    if (underline) {
+      var half = ctx.measureText(name).width / 2, ly = y + 11;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(x - half, ly);
+      ctx.lineTo(x + half, ly);
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = "rgba(0,0,0,0.85)";
+      ctx.stroke();
+      ctx.lineWidth = 1.8;
+      ctx.strokeStyle = underline;
+      ctx.stroke();
+    }
     ctx.restore();
+  }
+
+  // My Magnum shell in flight: a glowing dot moving along its path, with the rest
+  // of the path ahead and the landing spot. pts: [[x, y, ms after the shot], ...].
+  function shellAt(pts, t) {
+    var i, a, b, k;
+    if (t <= pts[0][2]) return { x: pts[0][0], y: pts[0][1], i: 0 };
+    for (i = 1; i < pts.length; i++) {
+      if (t > pts[i][2]) continue;
+      a = pts[i - 1]; b = pts[i];
+      k = b[2] > a[2] ? (t - a[2]) / (b[2] - a[2]) : 1;
+      return { x: a[0] + (b[0] - a[0]) * k, y: a[1] + (b[1] - a[1]) * k, i: i };
+    }
+    a = pts[pts.length - 1];
+    return { x: a[0], y: a[1], i: pts.length };
+  }
+
+  // On landing the shell turns red for half a second, then it is gone.
+  var SHELL_BURST_MS = 500;
+  var SHELL_BURST_COLOR = "#ff2a2a";
+
+  function drawShellBurst(ctx, p, t) {
+    var k = t / SHELL_BURST_MS, r = 5 + 5 * k;
+    ctx.save();
+    ctx.globalAlpha = 1 - 0.5 * k;
+    ctx.shadowColor = SHELL_BURST_COLOR;
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = SHELL_BURST_COLOR;
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  // Returns true while the shell is still flying or bursting, so the window keeps drawing.
+  function drawShell(ctx, toScreen, shell, now) {
+    var pts = shell && shell.pts;
+    if (!pts || pts.length < 2 || !isFiniteNum(shell.firedAt)) return false;
+    var t = now - shell.firedAt, end = pts[pts.length - 1], color = shell.color || "#ffb000";
+    if (t < 0 || t > end[2] + SHELL_BURST_MS) return false;
+    if (t > end[2]) {
+      drawShellBurst(ctx, toScreen(end[0], end[1]), t - end[2]);
+      return true;
+    }
+    var at = shellAt(pts, t), p = toScreen(at.x, at.y), e = toScreen(end[0], end[1]), i, q;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    for (i = at.i; i < pts.length; i++) { q = toScreen(pts[i][0], pts[i][1]); ctx.lineTo(q.x, q.y); }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(e.x, e.y, 7, 0, Math.PI * 2); ctx.stroke();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = "#fff6d6";
+    ctx.strokeStyle = color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+    return true;
   }
 
   function drawSkull(ctx, x, y, color) {
@@ -318,24 +452,28 @@
   }
 
   function drawUnits(ctx, vt, W, H, units, o) {
-    var i, u, p;
+    var i, u, p, s, glow;
     for (i = 0; i < (units || []).length; i++) {
       u = units[i];
       p = vt.toScreen(u.x, u.y);
-      if (offView(p, W, H, 30)) continue;
+      s = unitScale(u);
+      if (offView(p, W, H, 30 * s)) continue;
+      glow = killerGlow(u);
       ctx.save();
-      ctx.globalAlpha = o.covered(u) ? COVERED_ALPHA : 1;
-      drawUnitMarker(ctx, vt, u, p, sideColor(u.side, SIDE.unknown), u.carrying ? 0.95 : 0.85);
+      ctx.globalAlpha = o.covered(u) && !glow ? COVERED_ALPHA : 1;
+      if (glow) { ctx.shadowColor = HIT_COLOR; ctx.shadowBlur = glow; }
+      drawUnitMarker(ctx, vt, u, p, glow ? HIT_COLOR : sideColor(u.side, SIDE.unknown), (u.carrying ? 0.95 : 0.85) * s);
       ctx.restore();
+      if (hitBlinkOn(u)) drawHitFrame(ctx, p.x, p.y, s);
       if (u.carrying) drawBlinkingFlag(ctx, p.x + 6, p.y - 4, sideColor(u.carrying, SIDE.neutral));
       if (o.heights && o.selfZ != null && isFiniteNum(u.z)) drawHeightMark(ctx, p.x, p.y, u.z - o.selfZ);
-      if (o.health) drawHealth(ctx, p.x + 9, p.y + 8, u.hp);
-      if (o.names && u.name) drawName(ctx, p.x, p.y + (o.health && hasHealth(u.hp) ? 22 : 14), u.name, sideColor(u.side, SIDE.unknown));
+      if (o.health) drawHealth(ctx, p.x + 9 * s, p.y + 8 * s, u.hp);
+      if (o.names && u.name) drawName(ctx, p.x, p.y + 8 * (s - 1) + (o.health && hasHealth(u.hp) ? 22 : 14), u.name, nameColor(u), u.underline);
     }
   }
 
   function drawSelf(ctx, vt, self, W, H, viewM, o) {
-    var p = vt.toScreen(self.x, self.y);
+    var p = vt.toScreen(self.x, self.y), s = unitScale(self);
     ctx.save();
     ctx.globalAlpha = o.covered(self) ? COVERED_ALPHA : 1;
     if (self.dead) {
@@ -355,10 +493,10 @@
       ctx.lineTo(end.x, end.y);
       ctx.stroke();
       var d = vt.dir(hx, hy);
-      drawSelfArrow(ctx, p.x, p.y, d.x, d.y);
+      drawSelfArrow(ctx, p.x, p.y, d.x, d.y, s);
     }
     ctx.restore();
-    if (o.health && !self.dead) drawHealth(ctx, p.x + 11, p.y + 8, self.hp);
+    if (o.health && !self.dead) drawHealth(ctx, p.x + 11 * s, p.y + 8 * s, self.hp);
   }
 
   function drawNorth(ctx, vt, W) {
@@ -412,6 +550,72 @@
     return isFiniteNum(self.heading) ? self.heading : null;
   }
 
+  // Frames arrive ~30 times a second. Between them keep moving and turning at the
+  // last measured rate: prediction rather than smoothing, so the view never lags.
+  var AHEAD_MAX_MS = 80;
+  var MAX_SPEED_M_PER_MS = 0.06;
+  var MAX_TURN_RAD_PER_MS = 0.01;
+
+  function wrapAngle(a) {
+    return Math.atan2(Math.sin(a), Math.cos(a));
+  }
+
+  function createMotion() {
+    return { t: null, x: 0, y: 0, a: null, vx: 0, vy: 0, w: 0 };
+  }
+
+  // m: motion state kept between draws; t: when the page sampled this frame.
+  function predictMotion(m, self, t, now) {
+    var a = facingAngle(self), dt;
+    if (!isFiniteNum(t)) return { x: self.x, y: self.y, facing: a, moving: false };
+    if (m.t !== t) {
+      dt = m.t == null ? 0 : t - m.t;
+      if (dt > 0 && dt < 400) {
+        m.vx = (self.x - m.x) / dt;
+        m.vy = (self.y - m.y) / dt;
+        if (Math.sqrt(m.vx * m.vx + m.vy * m.vy) > MAX_SPEED_M_PER_MS) { m.vx = 0; m.vy = 0; }
+        m.w = a != null && m.a != null ? wrapAngle(a - m.a) / dt : 0;
+        if (Math.abs(m.w) > MAX_TURN_RAD_PER_MS) m.w = 0;
+      } else {
+        m.vx = 0; m.vy = 0; m.w = 0;
+      }
+      m.t = t; m.x = self.x; m.y = self.y; m.a = a;
+    }
+    var ahead = Math.max(0, Math.min(AHEAD_MAX_MS, now - t));
+    return {
+      x: self.x + m.vx * ahead, y: self.y + m.vy * ahead,
+      facing: a == null ? null : a + m.w * ahead,
+      moving: !!(m.vx || m.vy || m.w) && now - t < AHEAD_MAX_MS
+    };
+  }
+
+  function movedTo(o, x, y) {
+    var c = {}, k;
+    for (k in o) if (Object.prototype.hasOwnProperty.call(o, k)) c[k] = o[k];
+    c.x = x;
+    c.y = y;
+    return c;
+  }
+
+  function clampSpan(v, lo, hi) {
+    return lo > hi ? (lo + hi) / 2 : Math.max(lo, Math.min(hi, v));
+  }
+
+  // Centre on the tank, but near the edge of the map slide the view inwards so the
+  // window shows map instead of the void past its edge. The tank always stays in sight.
+  function fitCenter(self, b, W, H, viewM, rot) {
+    var cosR = Math.cos(rot), sinR = Math.sin(rot), ac = Math.abs(cosR), as = Math.abs(sinR);
+    var ex = (W / 2 * ac + H / 2 * as) / viewM, ey = (W / 2 * as + H / 2 * ac) / viewM;
+    var x = clampSpan(self.x, b.xmin + ex, b.xmax - ex), y = clampSpan(self.y, b.ymin + ey, b.ymax - ey);
+    var margin = Math.max(30, 0.1 * Math.min(W, H));
+    var rx = self.x - x, ry = self.y - y;
+    var u = (rx * cosR - ry * sinR) * viewM, v = (rx * sinR + ry * cosR) * viewM;
+    var mu = Math.max(0, W / 2 - margin), mv = Math.max(0, H / 2 - margin);
+    var u2 = Math.max(-mu, Math.min(mu, u)), v2 = Math.max(-mv, Math.min(mv, v));
+    if (u2 === u && v2 === v) return { x: x, y: y };
+    return { x: self.x - (u2 * cosR + v2 * sinR) / viewM, y: self.y - (v2 * cosR - u2 * sinR) / viewM };
+  }
+
   function drawPicture(ctx, L, view, self, W, H, cx, cy, viewM, rot) {
     var b = L.bounds, k = viewM / b.scale, c = layers.worldToPicture(cx, cy, b);
     var reach = Math.sqrt(W * W + H * H) / 2 / k;
@@ -461,10 +665,12 @@
     ctx.fillText(barM + " м", bx, by - 5);
   }
 
-  function drawFrame(canvas, f, view, L) {
+  function drawFrame(canvas, f, view, L, motion) {
     var ctx = canvas.getContext("2d");
     var W = canvas.width, H = canvas.height;
     var self = f.self && isFiniteNum(f.self.x) ? f.self : null;
+    var pred = self && motion ? predictMotion(motion, self, f.time, Date.now()) : null;
+    if (pred) self = movedTo(self, pred.x, pred.y);
     var b = L && L.offscreen && L.bounds, viewM = 1, cx = 0, cy = 0, rot = 0, levelLabel = "";
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
@@ -474,12 +680,13 @@
       var zoom = Math.max(0.25, view.zoom || 1);
       viewM = Math.min(W / (b.xmax - b.xmin), H / (b.ymax - b.ymin)) * zoom;
       var follow = self && (view.rotate || (view.follow !== false && zoom > 1.001));
-      cx = follow ? self.x : (b.xmin + b.xmax) / 2;
-      cy = follow ? self.y : (b.ymin + b.ymax) / 2;
       if (view.rotate && self) {
-        var facing = facingAngle(self);
+        var facing = pred ? pred.facing : facingAngle(self);
         if (facing != null) rot = Math.PI / 2 - facing;
       }
+      var center = follow ? fitCenter(self, b, W, H, viewM, rot) : { x: (b.xmin + b.xmax) / 2, y: (b.ymin + b.ymax) / 2 };
+      cx = center.x;
+      cy = center.y;
       try { levelLabel = drawPicture(ctx, L, view, self, W, H, cx, cy, viewM, rot); } catch (eP) {}
     }
     var cosR = Math.cos(rot), sinR = Math.sin(rot);
@@ -508,6 +715,10 @@
     (f.paths || []).forEach(function (path) {
       try { drawPath(ctx, vt.toScreen, path); } catch (eP) {}
     });
+    var shellFlying = false, drawNow = Date.now();
+    (f.shells || []).forEach(function (sh) {
+      try { if (drawShell(ctx, vt.toScreen, sh, drawNow)) shellFlying = true; } catch (eSh) {}
+    });
     if (self) try { drawSelf(ctx, vt, self, W, H, viewM, opts); } catch (eSelf) {}
     if (b) drawScaleBar(ctx, W, H, viewM);
     if (rot) drawNorth(ctx, vt, W);
@@ -516,11 +727,11 @@
       ctx.fillStyle = "#e8edf2";
       ctx.fillText("этаж: " + levelLabel, W - 70, H - 8);
     }
-    return { levelLabel: levelLabel };
+    return { levelLabel: levelLabel, moving: !!(pred && pred.moving) || shellFlying };
   }
 
   function createRenderer() {
-    var picture = null, mapId = null;
+    var picture = null, mapId = null, motion = createMotion();
     return {
       setMap: function (id, data, options, log) {
         if (!data || !data.collision) return false;
@@ -533,10 +744,10 @@
         mapId = id;
         return true;
       },
-      clear: function () { picture = null; mapId = null; },
+      clear: function () { picture = null; mapId = null; motion = createMotion(); },
       mapId: function () { return mapId; },
       draw: function (canvas, frame, view) {
-        return drawFrame(canvas, frame || {}, view || {}, picture);
+        return drawFrame(canvas, frame || {}, view || {}, picture, motion);
       }
     };
   }

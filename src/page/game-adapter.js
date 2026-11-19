@@ -56,7 +56,7 @@
     turretAngle: "lzr_1", elevationAngle: "tzr_1", turretSpeedNow: "wzy_1", turretSpeedMax: "uzy_1",
     turretController: "qzy_1", elevationSpeedNow: "r1a8_1", elevationSpeedMax: "s1a8_1", barrelMount: "n1a8_1",
     reloadProgress: "w12q", reloadTime: "v18v_1", reloadReadyAt: "w18v_1", reloadStunned: "x18v_1",
-    salvoReloadTime: "g18y_1", salvoEndsAt: "j18y_1", magnumReloadTime: "q1a9_1", magnumCharge: "w1a9_1",
+    salvoReloadTime: "g18y_1", salvoEndsAt: "j18y_1", magnumReloadTime: "q1a9_1", magnumCharge: "w1a9_1", magnumShots: "o1a9_1",
     idlePeriod: "r15i_1", idleWarnAt: "s15i_1", idleElapsed: "t15i_1", idlePaused: "w15i_1", weaponKind: "l15j_1",
 
     // ui store
@@ -150,7 +150,7 @@
 
     // magnum
     aimHit: "s1ab_1", aimPointCount: "t1ab_1", aimPoints: "o1ab_1", aimPointPosition: "b14v_1",
-    aimState: "k1ab_1", aimMark: "i1ab_1", aimActive: "m1ab_1", aimTankBody: "c1ab_1",
+    aimState: "k1ab_1", aimMark: "i1ab_1", aimActive: "m1ab_1", aimTankBody: "c1ab_1", aimGravity: "j1ab_1",
 
     // console
     consolePrint: "z2i"

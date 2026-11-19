@@ -10,6 +10,9 @@
   var PATH_COLORS = { magnum: "#ffb000", grenade: "#9be15d" };
   var BAR_COLORS = { reload: "#ffb000", overdrive: "#b06bff" };
   var PARKOUR_ONLY = "parkour only";
+  // On Magnum, enemy Magnums are the ones that can shell you back: underline their names.
+  var MAGNUM = "Магнум";
+  var RIVAL_UNDERLINE = "#ff3b3b";
   var MAP_OPTIONS = { orientation: null, hiddenBoxes: "grenade|aiming|foam|smoke", unitWidth: 3.5 };
   var PLAYER_COLUMNS = ["Игрок", "Пушка", "Корпус", "Очки", "У", "С"];
 
@@ -118,11 +121,20 @@
     return aim ? { pts: aim.pts, end: aim.land, color: color } : null;
   }
 
+  function shell(s) {
+    return s && s.path ? { pts: s.path, firedAt: s.firedAt, color: PATH_COLORS.magnum } : null;
+  }
+
   function frame(raw) {
+    var onMagnum = !!(raw.tank && raw.tank.turret === MAGNUM);
     var units = (raw.tanks || []).map(function (t) {
-      return { x: t.x, y: t.y, z: t.z, side: t.side, dir: t.hd, hp: t.hp, name: t.name };
+      var rival = onMagnum && t.side === "enemy" && t.turret === MAGNUM;
+      return {
+        x: t.x, y: t.y, z: t.z, side: t.side, dir: t.hd, hp: t.hp, name: t.name, hitAt: t.hitAt, big: !!t.big,
+        killedMeAt: t.killedMeAt, underline: rival ? RIVAL_UNDERLINE : null
+      };
     }).concat((raw.carriers || []).map(function (c) {
-      return { x: c.x, y: c.y, z: c.z, side: c.side, dir: c.hd, hp: c.hp, carrying: c.flagSide };
+      return { x: c.x, y: c.y, z: c.z, side: c.side, dir: c.hd, hp: c.hp, name: c.name, hitAt: c.hitAt, killedMeAt: c.killedMeAt, carrying: c.flagSide };
     }));
     var flags = (raw.bases || []).map(function (b) {
       return { x: b.x, y: b.y, side: b.side, state: b.taken ? "taken" : "home" };
@@ -134,7 +146,7 @@
     });
     var me = raw.me;
     return {
-      self: me ? { x: me.x, y: me.y, z: me.z, heading: me.heading, aim: raw.ray, hp: me.hp, dead: !!me.dead } : null,
+      self: me ? { x: me.x, y: me.y, z: me.z, heading: me.heading, aim: raw.ray, hp: me.hp, dead: !!me.dead, big: !!me.big } : null,
       units: units,
       flags: flags,
       points: points,
@@ -142,11 +154,13 @@
         return { x: m.x, y: m.y, side: m.side, icon: "hazard", alpha: m.active ? 1 : 0.55 };
       }).concat((raw.dead || []).map(function (d) { return { x: d.x, y: d.y, side: d.side, icon: "skull" }; })),
       paths: [path(raw.aim, PATH_COLORS.magnum), path(raw.grenadeAim, PATH_COLORS.grenade)].filter(Boolean),
+      shells: (raw.shells || []).map(shell).filter(Boolean),
       info: infoRows(raw),
       banner: banner(raw),
       summary: summary(raw),
       status: raw.status,
-      controls: controls(raw.parkour)
+      controls: controls(raw.parkour),
+      time: raw.time
     };
   }
 
